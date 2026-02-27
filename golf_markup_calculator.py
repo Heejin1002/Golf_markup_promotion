@@ -193,35 +193,28 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
             comm_d = comm / 100
             comm_str = str(comm).replace('.', '_')
 
-            # 판매가 = 패키지세일(₩), 공급가 = 판매가 / (1 + 수수료율)
+            # 판매가 = 패키지세일(₩), 공급가 = 판매가 × (1 - 수수료율)
             final_price_krw = pkg_sale_krw
-            supply_krw = round(final_price_krw / (1 + comm_d)) if exchange_rate > 0 else 0
+            supply_krw = round(final_price_krw * (1 - comm_d)) if exchange_rate > 0 else 0
             commission_krw = final_price_krw - supply_krw
-            margin_krw = final_price_krw - supply_krw
-
-            # 필요 마크업 (넷가 > 공급가일 때)
-            supply_thb = pkg_sale / (1 + comm_d)
-            req_markup = 0
-            if supply_thb > 0 and supply_thb < pkg_net:
-                req_markup = math.ceil((pkg_net / supply_thb - 1) * 100)
+            margin_krw = supply_krw - pkg_net_krw
 
             # 조정 판매가/공급가/마진 역산
             # 조정이 필요한 경우: 목표마진율 입력(>0) OR 마진이 음수
             need_adjust = (min_margin_rate > 0) or (margin_krw < 0)
-            if need_adjust and exchange_rate > 0:
+            if need_adjust and exchange_rate > 0 and (1 - comm_d) > 0:
                 # 조정공급가 = 패키지넷 / (1 - 목표마진율%)  → 공급가 대비 마진 비율
                 adj_supply_krw = math.ceil(pkg_net_krw / (1 - min_margin_rate / 100))
-                # 조정판매가 = 조정공급가 × (1 + 수수료율)
-                target_final_krw = math.ceil(adj_supply_krw * (1 + comm_d))
-                # 조정마진 = 조정판매가 - 조정공급가
-                adj_margin_krw = target_final_krw - adj_supply_krw
+                # 조정판매가 = 조정공급가 ÷ (1 - 수수료율)
+                target_final_krw = math.ceil(adj_supply_krw / (1 - comm_d))
+                # 조정마진 = 조정공급가 - 패키지넷(₩)
+                adj_margin_krw = adj_supply_krw - pkg_net_krw
             else:
                 # 목표마진율 미입력이고 마진 ≥ 0 → 조정 불필요, 모두 0
                 target_final_krw = 0
                 adj_supply_krw = 0
                 adj_margin_krw = 0
 
-            rec[f'필요마크업_{comm_str}%'] = f"{req_markup}%" if req_markup > 0 else "0%"
             if exchange_rate > 0:
                 rec[f'판매가_{comm_str}%(₩)'] = final_price_krw
                 rec[f'공급가_{comm_str}%(₩)'] = supply_krw
@@ -238,9 +231,19 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
 # ─────────────────────────────────────────────
 #  스타일
 # ─────────────────────────────────────────────
+BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '조정판매가_', '조정공급가_', '조정마진_')
+
 def style_df(df):
+    # 볼드 처리할 컬럼 인덱스
+    bold_cols = {i for i, col in enumerate(df.columns) if col.startswith(BOLD_PREFIXES)}
+
     def highlight(row):
         styles = [''] * len(row)
+
+        # 지정 컬럼만 굵게
+        for i in bold_cols:
+            styles[i] = 'font-weight: bold'
+
         # 마진 마이너스 → 행 전체 빨강
         for i, col in enumerate(row.index):
             if '마진' in col:
@@ -250,18 +253,11 @@ def style_df(df):
                         return ['background-color: #fee2e2; color: #dc2626; font-weight: bold'] * len(row)
                 except:
                     pass
-        # 필요마크업 > 0 → 셀 빨강
-        for i, col in enumerate(row.index):
-            if '필요마크업' in col:
-                try:
-                    v = float(str(row[col]).replace('%', ''))
-                    if v > 0:
-                        styles[i] = 'background-color: #fee2e2; color: #dc2626; font-weight: bold'
-                except:
-                    pass
-        # 주말/연휴 행 → 연한 노랑
+
+        # 주말/연휴 행 → 연한 노랑 (굵기 유지)
         if '주중/주말' in row.index and row['주중/주말'] == '주말/연휴':
-            return ['background-color: #fefce8'] * len(row)
+            return [s + '; background-color: #fefce8' if s else 'background-color: #fefce8' for s in styles]
+
         return styles
 
     return df.style.apply(highlight, axis=1)
@@ -398,6 +394,18 @@ def main():
                 )
 
         styled = style_df(display_df)
+
+        # 컬럼명 볼드 처리 CSS
+        bold_prefixes = ('판매가_', '공급가_', '마진_', '조정판매가_', '조정공급가_', '조정마진_')
+        bold_col_indices = [i for i, col in enumerate(display_df.columns) if col.startswith(bold_prefixes)]
+        if bold_col_indices:
+            # th 셀렉터: Streamlit dataframe 헤더는 th[data-testid="column-header-cell"] 내부 span
+            css_rules = " ".join([
+                f'div[data-testid="stDataFrame"] thead tr th:nth-child({i+2}) div {{ font-weight: 900 !important; }}'
+                for i in bold_col_indices
+            ])
+            st.markdown(f"<style>{css_rules}</style>", unsafe_allow_html=True)
+
         st.dataframe(styled, use_container_width=True, height=600)
 
         # ── 주중/주말 비교 요약 섹션
