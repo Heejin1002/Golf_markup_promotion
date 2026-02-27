@@ -197,7 +197,7 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
             final_price_krw = pkg_sale_krw
             supply_krw = round(final_price_krw / (1 + comm_d)) if exchange_rate > 0 else 0
             commission_krw = final_price_krw - supply_krw
-            margin_krw = supply_krw - pkg_net_krw
+            margin_krw = final_price_krw - supply_krw
 
             # 필요 마크업 (넷가 > 공급가일 때)
             supply_thb = pkg_sale / (1 + comm_d)
@@ -213,8 +213,8 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
                 adj_supply_krw = math.ceil(pkg_net_krw / (1 - min_margin_rate / 100))
                 # 조정판매가 = 조정공급가 × (1 + 수수료율)
                 target_final_krw = math.ceil(adj_supply_krw * (1 + comm_d))
-                # 조정마진 = 조정공급가 - 패키지넷
-                adj_margin_krw = adj_supply_krw - pkg_net_krw
+                # 조정마진 = 조정판매가 - 조정공급가
+                adj_margin_krw = target_final_krw - adj_supply_krw
             else:
                 # 목표마진율 미입력이고 마진 ≥ 0 → 조정 불필요, 모두 0
                 target_final_krw = 0
