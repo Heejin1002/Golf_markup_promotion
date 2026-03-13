@@ -86,6 +86,211 @@ def export_df_to_google_sheets(
     return True
 
 
+def _parse_period_end(period_str: str):
+    """기간 문자열에서 종료일 파싱. 예: '2025-11-26 ~ 2026-03-31' -> 2026-03-31."""
+    if not period_str or not isinstance(period_str, str):
+        return None
+    m = re.search(r"~\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*$", period_str.strip())
+    if not m:
+        return None
+    s = m.group(1).replace("/", "-")
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def export_all_results_to_google_sheets(
+    results,
+    spreadsheet_id: str,
+    sheet_name: str = "요금표",
+    extracted_date: str | None = None,
+):
+    """여러 개의 요금표(results 리스트)를 한 번에 내보냅니다.
+
+    - 각 요금표 블록 위에 구분선 행 추가 (첫 블록 위: 진한 회색, 사이: 연한 회색)
+    - 요금표가 2개 이상이면 마지막 2개를 비교해 '판매가 증가율' = (A/B - 1)*100% 를 마지막 열에 추가
+      (A=기간이 최신인 쪽 판매가, B=기간이 더 이전인 쪽 판매가)
+    """
+    if not GSPREAD_AVAILABLE:
+        raise RuntimeError("gspread 패키지가 필요합니다. pip install gspread google-auth")
+    creds_dict = st.secrets.get("gcp_service_account")
+    if not creds_dict:
+        raise RuntimeError("스트림릿 시크릿에 gcp_service_account를 설정해 주세요.")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(spreadsheet_id)
+    try:
+        worksheet = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=sheet_name, rows=500, cols=30)
+
+    try:
+        header_row = worksheet.row_values(1)
+    except Exception:
+        header_row = []
+    if len(header_row) < 1 or (header_row[0] or "").strip() != "상품명":
+        worksheet.update_acell("A1", "상품명")
+    if len(header_row) < 3 or (header_row[2] or "").strip() != "기간":
+        worksheet.update_acell("C1", "기간")
+
+    all_vals = worksheet.get_all_values()
+    next_row = len(all_vals) + 1 if all_vals else 2
+    extracted_date = extracted_date or datetime.date.today().isoformat()
+
+    # 유효한 요금표만 (df 있음)
+    valid_results = []
+    for res in results or []:
+        df = (res or {}).get("df")
+        if df is None or df.empty:
+            continue
+        valid_results.append(res)
+
+    # 요금표 2개 이상일 때: 마지막 2개 비교 -> (key -> (A, B)) 맵. A=최신 판매가, B=이전 판매가
+    increase_rate_map = {}  # key (홀, 시간대, 주중/주말) -> (A, B) then rate = (A/B - 1)*100
+    sale_col = None  # 판매가 컬럼명 (첫 번째 '판매가_' 로 시작하는 컬럼)
+    num_export_cols = 23  # 기본: A~W (추출날짜까지)
+
+    if len(valid_results) >= 2:
+        res1, res2 = valid_results[-2], valid_results[-1]
+        df1, df2 = res1.get("df"), res2.get("df")
+        meta1, meta2 = res1.get("meta") or {}, res2.get("meta") or {}
+        period1, period2 = meta1.get("period") or "", meta2.get("period") or ""
+        end1, end2 = _parse_period_end(period1), _parse_period_end(period2)
+        # 기간이 최신인 쪽 = A, 그렇지 않은 쪽 = B
+        if end2 and end1 and end2 >= end1:
+            df_old, df_new = df1, df2
+        else:
+            df_old, df_new = df2, df1
+
+        for c in df_new.columns:
+            if str(c).startswith("판매가_"):
+                sale_col = c
+                break
+        # 조정판매가가 있으면(0이 아니면) 조정판매가, 없으면 판매가 사용 (같은 수수료 컬럼 대응)
+        adj_col = None
+        if sale_col:
+            suffix = str(sale_col).replace("판매가_", "", 1)
+            adj_col = f"조정판매가_{suffix}"
+            if adj_col not in df_new.columns or adj_col not in df_old.columns:
+                adj_col = None
+
+        def _price_for_row(dframe, i, sale_c, adj_c):
+            if adj_c and adj_c in dframe.columns:
+                try:
+                    v = float(dframe.iloc[i][adj_c])
+                    if v and v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+            try:
+                return float(dframe.iloc[i][sale_c]) if sale_c in dframe.columns else None
+            except (TypeError, ValueError):
+                return None
+
+        if sale_col and sale_col in df_old.columns and sale_col in df_new.columns:
+            key_cols = ["홀", "시간대", "주중/주말"]
+            if all(k in df_old.columns and k in df_new.columns for k in key_cols):
+                old_by_key = {}
+                for i in range(len(df_old)):
+                    key = tuple(df_old.iloc[i][k] for k in key_cols)
+                    p = _price_for_row(df_old, i, sale_col, adj_col)
+                    if p is not None:
+                        old_by_key[key] = p
+                for i in range(len(df_new)):
+                    key = tuple(df_new.iloc[i][k] for k in key_cols)
+                    A = _price_for_row(df_new, i, sale_col, adj_col)
+                    B = old_by_key.get(key)
+                    if A is not None and B is not None and B != 0:
+                        rate = (A / B - 1) * 100
+                        increase_rate_map[key] = (A, B, rate)
+        num_export_cols = 24  # 마지막 열에 '판매가 증가율' 추가
+
+    rows = []
+    dark_sep_rows = []
+    light_sep_rows = []
+    first_block = True
+
+    for res in results or []:
+        df = (res or {}).get("df")
+        if df is None or df.empty:
+            continue
+        meta = (res or {}).get("meta") or {}
+        product_name = (meta.get("product_name") or {}).get("en") or ""
+        period = meta.get("period") or ""
+
+        sep_row = [""] * num_export_cols
+        sep_row_index = next_row + len(rows)
+        rows.append(sep_row)
+        if first_block:
+            dark_sep_rows.append(sep_row_index)
+            first_block = False
+        else:
+            light_sep_rows.append(sep_row_index)
+
+        df_str = df.astype(str)
+        key_cols = ["홀", "시간대", "주중/주말"]
+        has_keys = all(k in df.columns for k in key_cols) if key_cols else False
+        # 가장 최신 요금표(마지막 블록)에만 판매가 증가율 표시
+        is_newest_block = len(valid_results) >= 2 and res is valid_results[-1]
+
+        for i in range(len(df_str)):
+            row = [product_name, "", period] + df_str.iloc[i].tolist()
+            # W열(22번 인덱스) = 추출날짜
+            if len(row) <= 22:
+                row.extend([""] * (23 - len(row)))
+            row[22] = extracted_date
+            # X열 = 판매가 증가율 (가장 최신 요금표 행에만)
+            if num_export_cols >= 24:
+                if is_newest_block and has_keys and increase_rate_map:
+                    key = tuple(df.iloc[i][k] for k in key_cols)
+                    t = increase_rate_map.get(key)
+                    if t is not None:
+                        row.append(f"{t[2]:.2f}%")
+                    else:
+                        row.append("")
+                else:
+                    row.append("")
+            rows.append(row)
+
+    if not rows:
+        return True
+
+    needed_rows = next_row + len(rows) - 1
+    if worksheet.row_count < needed_rows:
+        worksheet.add_rows(needed_rows - worksheet.row_count)
+
+    start_cell = f"A{next_row}"
+    worksheet.update(range_name=start_cell, values=rows, value_input_option="USER_ENTERED")
+
+    # 헤더 1행에 '판매가 증가율' 열이 있으면 유지, 없으면 X1에 기록 (마지막 열)
+    if num_export_cols >= 24:
+        try:
+            h = worksheet.row_values(1)
+            if len(h) < 24 or (h[23] or "").strip() != "판매가 증가율":
+                worksheet.update_acell("X1", "판매가 증가율")
+        except Exception:
+            worksheet.update_acell("X1", "판매가 증가율")
+
+    def _format_rows(idxs, bg):
+        if not idxs:
+            return
+        last_col = "X" if num_export_cols >= 24 else "W"
+        for r in idxs:
+            rng = f"A{r}:{last_col}{r}"
+            worksheet.format(
+                rng,
+                {
+                    "backgroundColor": {"red": bg[0], "green": bg[1], "blue": bg[2]},
+                    "textFormat": {"bold": True},
+                },
+            )
+
+    _format_rows(dark_sep_rows, (0.4, 0.4, 0.4))
+    _format_rows(light_sep_rows, (0.9, 0.9, 0.9))
+    return True
+
 # ─────────────────────────────────────────────
 #  HTML 파서: 골프 요금표
 # ─────────────────────────────────────────────
@@ -347,7 +552,7 @@ def _extract_status(html_block: str, name_pattern: str):
     return None
 
 
-def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin_rate=0.0):
+def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin_rate=0.0, is_marit: bool = False):
     """
     rows: parse_golf_html 결과
     반환: DataFrame
@@ -357,6 +562,14 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
     for r in rows:
         hole = r['hole']
         time_of_day = r['time_of_day']
+        # 마리트 전용 필터: 27H 제외, 18H/36H만 + Morning/Afternoon만
+        if is_marit:
+            hole_str = str(hole).strip()
+            time_str = str(time_of_day).strip()
+            if hole_str not in ("18H", "36H"):
+                continue
+            if time_str not in ("Morning", "Afternoon"):
+                continue
         week_div = r['week_div']
         net_thb = r['net_thb']
         sale_thb = r['sale_thb']
@@ -480,6 +693,27 @@ def main():
     st.title("⛳ 골프 요금 마크업 계산기")
     st.markdown("골프 요금표 HTML을 붙여넣으면 패키지 요금 + 환율 + 수수료를 자동 계산합니다.")
 
+    # 체크박스 라벨 / 버튼 스타일 살짝 키우기 (마리트 옵션 포함, 공통 버튼 스타일)
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stCheckbox"] label span {
+            font-size: 1.05rem;
+            font-weight: 600;
+        }
+        div.stButton > button {
+            background-color: #2563eb !important;  /* 파란색 */
+            color: white !important;
+            border-radius: 8px;
+            padding: 0.5rem 1.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # session_state 초기화
     for key, default in [
         ('html_key', 0), ('result_df', None),
@@ -502,6 +736,13 @@ def main():
         st.write("")
         st.write("")
         calc_btn = st.button("🔢 계산하기", type="primary", use_container_width=True)
+
+    # 마리트 전용 필터 옵션
+    is_marit = st.checkbox(
+        "마리트 (27H 제외, Night 제외)",
+        help="체크하면 홀은 18H/36H만, 시간대는 Morning/Afternoon만 표시됩니다.",
+        key="is_marit",
+    )
 
     # ── HTML 입력 영역 (아래): 제목 → 캡션 → ➕ 추가 버튼
     st.markdown("### 골프 요금표 HTML 붙여넣기")
@@ -555,6 +796,7 @@ def main():
 
             discount_rate = 0.0
             min_margin_rate = 0.0
+            is_marit = st.session_state.get('is_marit', False)
             results = []
             total_rows = 0
             for idx, html_input in enumerate(valid_htmls, start=1):
@@ -571,7 +813,7 @@ def main():
                     })
                     continue
 
-                df = build_table(rows, exchange_rate, commission_rates, 0.0, min_margin_rate)
+                df = build_table(rows, exchange_rate, commission_rates, 0.0, min_margin_rate, is_marit=is_marit)
                 total_rows += len(rows)
                 results.append({
                     "idx": idx,
@@ -657,7 +899,8 @@ def main():
                         st.session_state['exchange_rate'],
                         st.session_state['commission_rates'],
                         0.0,
-                        new_margin
+                        new_margin,
+                        is_marit=st.session_state.get('is_marit', False),
                     )
                     rr = dict(r)
                     rr["df"] = df
@@ -739,48 +982,42 @@ def main():
             # CSV 다운로드 / 구글 스프레드시트 내보내기
             st.markdown("---")
             csv = df.to_csv(index=False, encoding='utf-8-sig')
-            dl_col, gs_col = st.columns(2)
-            with dl_col:
-                st.download_button(
-                    label="📥 CSV 다운로드",
-                    data=csv,
-                    file_name=f"golf_markup_result_{idx}.csv",
-                    mime="text/csv",
-                    key=f"csv_dl_{idx}",
-                )
-            with gs_col:
-                if GSPREAD_AVAILABLE:
-                    sheet_id_input = st.text_input(
-                        "구글 스프레드시트 ID 또는 URL",
-                        placeholder="예: 1ABC...xyz 또는 https://docs.google.com/spreadsheets/d/1ABC.../edit",
-                        key=f"sheet_id_{idx}",
-                    )
-                    if st.button("📤 내보내기", key=f"export_gs_{idx}"):
-                        if not sheet_id_input or not sheet_id_input.strip():
-                            st.error("스프레드시트 ID 또는 URL을 입력해 주세요.")
-                        else:
-                            raw = sheet_id_input.strip()
-                            # URL에서 ID 추출
-                            if "/d/" in raw:
-                                sid = raw.split("/d/")[1].split("/")[0].split("?")[0]
-                            else:
-                                sid = raw
-                            try:
-                                meta = res.get("meta") or {}
-                                pname = (meta.get("product_name") or {}).get("en") or ""
-                                period = meta.get("period") or ""
-                                with st.spinner("구글 스프레드시트로 내보내는 중..."):
-                                    export_df_to_google_sheets(
-                                        df, sid,
-                                        sheet_name="요금표",
-                                        product_name=pname,
-                                        period=period,
-                                    )
-                                st.success("구글 스프레드시트로 내보냈습니다.")
-                            except Exception as e:
-                                st.error(f"내보내기 실패: {e}")
-                else:
-                    st.caption("내보내기: pip install gspread google-auth 후 시크릿 설정 필요")
+            st.download_button(
+                label="📥 CSV 다운로드",
+                data=csv,
+                file_name=f"golf_markup_result_{idx}.csv",
+                mime="text/csv",
+                key=f"csv_dl_{idx}",
+            )
+
+        # ── 모든 요금표 한 번에 구글 시트로 내보내기 (최하단)
+        st.markdown("---")
+        st.markdown("### 내보내기")
+        has_gcp_secret = bool(st.secrets.get("gcp_service_account"))
+        # TODO: 나중에 st.secrets["golf_sheet_url"]로 변경 예정
+        sheet_url = "https://docs.google.com/spreadsheets/d/1qDp5Ty_NnQgYKfyhOnV0l5q7v8TPFtvsIi91GirO180/edit?gid=0#gid=0"
+        if GSPREAD_AVAILABLE and has_gcp_secret:
+            st.caption("모든 요금표를 한 번에 구글 시트로 내보냅니다. (맨 위 진한 회색, 각 요금표 사이 연한 회색 구분선 추가)")
+            col_l, col_btn, col_r = st.columns([2, 1, 2])
+            with col_btn:
+                if st.button("📤 전체 요금표 구글 시트로 내보내기"):
+                    raw = str(sheet_url).strip()
+                    if "/d/" in raw:
+                        sid = raw.split("/d/")[1].split("/")[0].split("?")[0]
+                    else:
+                        sid = raw
+                    try:
+                        with st.spinner("구글 스프레드시트로 모든 요금표를 내보내는 중..."):
+                            export_all_results_to_google_sheets(
+                                st.session_state.get("results") or [],
+                                sid,
+                                sheet_name="요금표",
+                            )
+                        st.success("모든 요금표를 구글 스프레드시트로 내보냈습니다.")
+                    except Exception as e:
+                        st.error(f"내보내기 실패: {e}")
+        else:
+            st.caption("구글 시트 내보내기를 사용하려면 gspread 설치 및 서비스계정 시크릿 설정이 필요합니다.")
 
 
 if __name__ == "__main__":
