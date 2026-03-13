@@ -214,7 +214,7 @@ def export_all_results_to_google_sheets(
             continue
         valid_results.append(res)
 
-    # 요금표 2개 이상일 때: 마지막 2개 비교 -> (key -> (A, B)) 맵. A=최신 판매가, B=이전 판매가
+        # 요금표 2개 이상일 때: 마지막 2개 비교 -> (key -> (A, B)) 맵. A=최신 최종판매가, B=이전 최종판매가
     increase_rate_map = {}  # key (홀, 시간대, 주중/주말) -> (A, B) then rate = (A/B - 1)*100
     sale_col = None  # 판매가 컬럼명 (첫 번째 '판매가_' 로 시작하는 컬럼)
     num_export_cols = 24  # 기본: A~X (추출날짜 + 환율)
@@ -229,11 +229,11 @@ def export_all_results_to_google_sheets(
             if str(c).startswith("판매가_"):
                 sale_col = c
                 break
-        # 조정판매가가 있으면(0이 아니면) 조정판매가, 없으면 판매가 사용 (같은 수수료 컬럼 대응)
+        # 최종판매가가 있으면 최종판매가, 없으면 판매가 사용 (같은 수수료 컬럼 대응)
         adj_col = None
         if sale_col:
             suffix = str(sale_col).replace("판매가_", "", 1)
-            adj_col = f"조정판매가_{suffix}"
+            adj_col = f"최종판매가_{suffix}"
             if adj_col not in df_new.columns or adj_col not in df_old.columns:
                 adj_col = None
 
@@ -685,42 +685,41 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
             comm_d = comm / 100
             comm_str = str(comm).replace('.', '_')
 
-            # 판매가 = 패키지세일(₩), 공급가 = 판매가 × (1 - 수수료율)
-            final_price_krw = pkg_sale_krw
-            supply_krw = round(final_price_krw * (1 - comm_d)) if exchange_rate > 0 else 0
-            commission_krw = final_price_krw - supply_krw
-            margin_krw = supply_krw - pkg_net_krw
+            # 기본 판매가/공급가/마진
+            base_price_krw = pkg_sale_krw
+            base_supply_krw = round(base_price_krw * (1 - comm_d)) if exchange_rate > 0 else 0
+            base_margin_krw = base_supply_krw - pkg_net_krw
 
-            # 조정 판매가/공급가/마진 역산
-            # 조정은 마진이 음수일 때만 적용 (마진이 '+'일 때는 적용하지 않음)
-            # 목표마진율 100% 미만일 때만 역산 (100% 이상이면 0으로 나누기 방지)
+            # 최종 판매가/공급가/마진 역산 (목표 마진율이 있고, 현재 마진이 0 이하인 경우에만 상향 조정)
             margin_pct = min_margin_rate / 100.0 if min_margin_rate is not None else 0.0
             need_adjust = (
-                (margin_krw < 0)
+                (base_margin_krw <= 0)
                 and exchange_rate > 0
                 and (1 - comm_d) > 0
                 and margin_pct < 1.0
             )
             if need_adjust:
-                # 조정공급가 = 패키지넷 / (1 - 목표마진율%)  → 공급가 대비 마진 비율
-                adj_supply_krw = math.ceil(pkg_net_krw / (1 - margin_pct))
-                # 조정판매가 = 조정공급가 ÷ (1 - 수수료율)
-                target_final_krw = math.ceil(adj_supply_krw / (1 - comm_d))
-                # 조정마진 = 조정공급가 - 패키지넷(₩)
-                adj_margin_krw = adj_supply_krw - pkg_net_krw
+                # 최종공급가 = 패키지넷 / (1 - 목표마진율%)  → 공급가 대비 마진 비율
+                final_supply_krw = math.ceil(pkg_net_krw / (1 - margin_pct))
+                # 최종판매가 = 최종공급가 ÷ (1 - 수수료율)
+                final_price_krw = math.ceil(final_supply_krw / (1 - comm_d))
+                # 최종마진 = 최종공급가 - 패키지넷(₩)
+                final_margin_krw = final_supply_krw - pkg_net_krw
             else:
-                # 목표마진율 미입력이고 마진 ≥ 0 → 조정 불필요, 모두 0
-                target_final_krw = 0
-                adj_supply_krw = 0
-                adj_margin_krw = 0
+                # 마진이 0 초과이면 기본값 그대로 최종값으로 사용
+                final_price_krw = base_price_krw
+                final_supply_krw = base_supply_krw
+                final_margin_krw = base_margin_krw
 
             if exchange_rate > 0:
-                rec[f'판매가_{comm_str}%(₩)'] = final_price_krw
-                rec[f'공급가_{comm_str}%(₩)'] = supply_krw
-                rec[f'마진_{comm_str}%(₩)'] = margin_krw
-                rec[f'조정판매가_{comm_str}%(₩)'] = target_final_krw
-                rec[f'조정공급가_{comm_str}%(₩)'] = adj_supply_krw
-                rec[f'조정마진_{comm_str}%(₩)'] = adj_margin_krw
+                # 기본 판매가/공급가/마진
+                rec[f'판매가_{comm_str}%(₩)'] = base_price_krw
+                rec[f'공급가_{comm_str}%(₩)'] = base_supply_krw
+                rec[f'마진_{comm_str}%(₩)'] = base_margin_krw
+                # 최종 판매가/공급가/마진 (마진<0이면 조정값, 마진≥0이면 기본값 복사)
+                rec[f'최종판매가_{comm_str}%(₩)'] = final_price_krw
+                rec[f'최종공급가_{comm_str}%(₩)'] = final_supply_krw
+                rec[f'최종마진_{comm_str}%(₩)'] = final_margin_krw
 
         records.append(rec)
 
@@ -742,8 +741,10 @@ def _comm_from_col_name(col_name: str, prefix: str) -> float | None:
 
 
 def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
-    """판매가/조정판매가 변경분을 반영해 공급가·마진·조정공급가·조정마진을 재계산합니다.
-    조정판매가/조정공급가/조정마진은 '마진'이 음수인 행에서만 적용하고, 마진이 0 이상인 행은 0으로 둡니다.
+    """판매가 변경분을 반영해 공급가·마진·최종공급가·최종마진을 재계산합니다.
+
+    - 판매가_: 기본 공급가/마진 재계산
+    - 최종판매가_/최종공급가_/최종마진_은 판매가/공급가/마진과 목표 마진율에 따라 자동 계산
     """
     out = df.copy()
     if "패키지넷(₩)" not in out.columns:
@@ -766,32 +767,58 @@ def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
             out[supply_col] = supply.astype(int)
             out[margin_col] = (supply - pkg_net).astype(int)
 
-    # 2) 조정판매가 → 조정공급가, 조정마진은 '마진'이 음수인 행에서만 적용
+    # 2) 판매가/공급가/마진 + 목표 마진율 → 최종판매가/최종공급가/최종마진 재계산
+    try:
+        margin_pct = float(st.session_state.get("min_margin_rate", 0.0)) / 100.0
+    except Exception:
+        margin_pct = 0.0
     for col in list(out.columns):
-        if not col.startswith("조정판매가_") or "(₩)" not in col:
+        if not col.startswith("판매가_") or "(₩)" not in col:
             continue
-        rate = _comm_from_col_name(col, "조정판매가_")
+        rate = _comm_from_col_name(col, "판매가_")
         if rate is None:
             continue
-        suffix = col.replace("조정판매가_", "", 1)
+        suffix = col.replace("판매가_", "", 1)
+        supply_col = f"공급가_{suffix}"
         margin_col = f"마진_{suffix}"
-        adj_supply_col = f"조정공급가_{suffix}"
-        adj_margin_col = f"조정마진_{suffix}"
-        if margin_col not in out.columns or adj_supply_col not in out.columns or adj_margin_col not in out.columns:
+        final_sale_col = f"최종판매가_{suffix}"
+        final_supply_col = f"최종공급가_{suffix}"
+        final_margin_col = f"최종마진_{suffix}"
+        if (
+            supply_col not in out.columns
+            or margin_col not in out.columns
+            or final_sale_col not in out.columns
+            or final_supply_col not in out.columns
+            or final_margin_col not in out.columns
+        ):
             continue
-        margin_vals = pd.to_numeric(out[margin_col], errors="coerce").fillna(0)
-        adj_sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
-        # 조정공급가 = 조정판매가 × (1 - 수수료율), build_table과 동일하게 올림
-        _raw = adj_sale * (1 - rate / 100)
-        adj_supply = _raw.apply(lambda x: int(math.ceil(x)) if pd.notna(x) else 0)
-        # 마진 < 0 인 행만 조정값 반영, 나머지는 0
-        mask_neg = margin_vals < 0
-        out[adj_supply_col] = 0
-        out.loc[mask_neg, adj_supply_col] = adj_supply.loc[mask_neg].astype(int)
-        out[adj_margin_col] = 0
-        out.loc[mask_neg, adj_margin_col] = (adj_supply.loc[mask_neg] - pkg_net.loc[mask_neg]).astype(int)
-        out[col] = 0
-        out.loc[mask_neg, col] = adj_sale.loc[mask_neg]
+        base_sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
+        base_supply = pd.to_numeric(out[supply_col], errors="coerce").fillna(0)
+        base_margin = pd.to_numeric(out[margin_col], errors="coerce").fillna(0)
+
+        # 기본값을 우선 복사
+        final_sale = base_sale.copy()
+        final_supply = base_supply.copy()
+        final_margin = base_margin.copy()
+
+        # 마진이 0 이하이고 목표 마진율이 유효하면 최종값 상향 조정
+        if margin_pct > 0.0 and margin_pct < 1.0:
+            mask = base_margin <= 0
+            if mask.any():
+                target_supply = (pkg_net / (1 - margin_pct)).apply(
+                    lambda x: int(math.ceil(x)) if pd.notna(x) else 0
+                )
+                target_sale = (target_supply / (1 - rate / 100.0)).apply(
+                    lambda x: int(math.ceil(x)) if pd.notna(x) else 0
+                )
+                target_margin = target_supply - pkg_net
+                final_sale[mask] = target_sale[mask]
+                final_supply[mask] = target_supply[mask]
+                final_margin[mask] = target_margin[mask]
+
+        out[final_sale_col] = final_sale.astype(int)
+        out[final_supply_col] = final_supply.astype(int)
+        out[final_margin_col] = final_margin.astype(int)
 
     return out
 
@@ -799,15 +826,15 @@ def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 #  스타일
 # ─────────────────────────────────────────────
-BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '조정판매가_', '조정공급가_', '조정마진_')
+BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '최종판매가_', '최종공급가_', '최종마진_')
 
 def style_df(df):
     # 볼드 처리할 컬럼 인덱스
     bold_cols = {i for i, col in enumerate(df.columns) if col.startswith(BOLD_PREFIXES)}
-    # 판매가/조정판매가 열 강조 (연한 파랑)
-    sale_cols = {i for i, col in enumerate(df.columns) if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col}
-    # 마진/조정마진 열 강조 (연한 노랑)
-    margin_cols = {i for i, col in enumerate(df.columns) if (col.startswith("마진_") or col.startswith("조정마진_")) and "(₩)" in col}
+    # 판매가/최종판매가 열 강조 (연한 파랑)
+    sale_cols = {i for i, col in enumerate(df.columns) if (col.startswith("판매가_") or col.startswith("최종판매가_")) and "(₩)" in col}
+    # 마진/최종마진 열 강조 (연한 노랑)
+    margin_cols = {i for i, col in enumerate(df.columns) if (col.startswith("마진_") or col.startswith("최종마진_")) and "(₩)" in col}
 
     def highlight(row):
         styles = [''] * len(row)
@@ -1141,10 +1168,10 @@ def main():
                 st.dataframe(styled_preview, use_container_width=True, height=fee_height, hide_index=True)
             else:
                 # 수정 모드: data_editor + 수정 완료 버튼 (셀 포커스 상태에서 바로 버튼 눌러도 반영되도록 blur 스크립트는 data_editor 아래 주입)
-                st.caption("판매가·조정판매가를 수정하면 해당 행의 공급가·마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
+                st.caption("판매가를 수정하면 해당 행의 공급가·마진·최종판매가·최종공급가·최종마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
                 column_config = {}
                 for col in df.columns:
-                    if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col:
+                    if col.startswith("판매가_") and "(₩)" in col:
                         column_config[col] = st.column_config.NumberColumn(col, format="%d")
                     else:
                         column_config[col] = st.column_config.Column(col, disabled=True)
