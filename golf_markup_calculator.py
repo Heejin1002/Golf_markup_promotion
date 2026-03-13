@@ -16,6 +16,57 @@ except ImportError:
 st.set_page_config(page_title="골프 요금 마크업 계산기", layout="wide")
 
 
+def _inject_blur_before_done_script() -> None:
+    """수정 완료 버튼 클릭 시 포커스가 셀에 있어도 먼저 blur 후 클릭이 처리되도록 스크립트 주입."""
+    doc = "window.parent.document"  # iframe 안이므로 부모(Streamlit 앱) 문서 사용
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          var doc = {doc};
+          var BLUR_DELAY_MS = 500;
+          function attachBlurHandler() {{
+            var buttons = doc.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {{
+              var btn = buttons[i];
+              if (btn.textContent.indexOf('수정 완료') !== -1 && !btn.dataset.blurHandled) {{
+                btn.dataset.blurHandled = '1';
+                btn.addEventListener('mousedown', function(e) {{
+                  var target = e.currentTarget;
+                  var active = doc.activeElement;
+                  if (active && active !== doc.body && active !== target) {{
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try {{
+                      active.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                      active.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }} catch (err) {{}}
+                    active.blur();
+                    setTimeout(function() {{ target.click(); }}, BLUR_DELAY_MS);
+                  }}
+                }}, true);
+                return true;
+              }}
+            }}
+            return false;
+          }}
+          function init() {{
+            if (!attachBlurHandler()) {{
+              setTimeout(init, 100);
+            }}
+          }}
+          if (doc.readyState === 'loading') {{
+            doc.addEventListener('DOMContentLoaded', function() {{ setTimeout(init, 100); }});
+          }} else {{
+            setTimeout(init, 150);
+          }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def export_df_to_google_sheets(
     df: pd.DataFrame,
     spreadsheet_id: str,
@@ -154,16 +205,10 @@ def export_all_results_to_google_sheets(
     num_export_cols = 24  # 기본: A~X (추출날짜 + 환율)
 
     if len(valid_results) >= 2:
-        res1, res2 = valid_results[-2], valid_results[-1]
-        df1, df2 = res1.get("df"), res2.get("df")
-        meta1, meta2 = res1.get("meta") or {}, res2.get("meta") or {}
-        period1, period2 = meta1.get("period") or "", meta2.get("period") or ""
-        end1, end2 = _parse_period_end(period1), _parse_period_end(period2)
-        # 기간이 최신인 쪽 = A, 그렇지 않은 쪽 = B
-        if end2 and end1 and end2 >= end1:
-            df_old, df_new = df1, df2
-        else:
-            df_old, df_new = df2, df1
+        # 기간이 아니라 입력 순서를 기준으로 비교
+        # 바로 이전 요금표를 B, 가장 마지막 요금표를 A로 사용
+        res_old, res_new = valid_results[-2], valid_results[-1]
+        df_old, df_new = res_old.get("df"), res_new.get("df")
 
         for c in df_new.columns:
             if str(c).startswith("판매가_"):
@@ -633,10 +678,17 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
 
             # 조정 판매가/공급가/마진 역산
             # 조정은 마진이 음수일 때만 적용 (마진이 '+'일 때는 적용하지 않음)
-            need_adjust = (margin_krw < 0) and exchange_rate > 0 and (1 - comm_d) > 0
+            # 목표마진율 100% 미만일 때만 역산 (100% 이상이면 0으로 나누기 방지)
+            margin_pct = min_margin_rate / 100.0 if min_margin_rate is not None else 0.0
+            need_adjust = (
+                (margin_krw < 0)
+                and exchange_rate > 0
+                and (1 - comm_d) > 0
+                and margin_pct < 1.0
+            )
             if need_adjust:
                 # 조정공급가 = 패키지넷 / (1 - 목표마진율%)  → 공급가 대비 마진 비율
-                adj_supply_krw = math.ceil(pkg_net_krw / (1 - min_margin_rate / 100))
+                adj_supply_krw = math.ceil(pkg_net_krw / (1 - margin_pct))
                 # 조정판매가 = 조정공급가 ÷ (1 - 수수료율)
                 target_final_krw = math.ceil(adj_supply_krw / (1 - comm_d))
                 # 조정마진 = 조정공급가 - 패키지넷(₩)
@@ -714,7 +766,9 @@ def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
             continue
         margin_vals = pd.to_numeric(out[margin_col], errors="coerce").fillna(0)
         adj_sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
-        adj_supply = (adj_sale * (1 - rate / 100)).round()
+        # 조정공급가 = 조정판매가 × (1 - 수수료율), build_table과 동일하게 올림
+        _raw = adj_sale * (1 - rate / 100)
+        adj_supply = _raw.apply(lambda x: int(math.ceil(x)) if pd.notna(x) else 0)
         # 마진 < 0 인 행만 조정값 반영, 나머지는 0
         mask_neg = margin_vals < 0
         out[adj_supply_col] = 0
@@ -735,28 +789,36 @@ BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '조정판매가_', '조
 def style_df(df):
     # 볼드 처리할 컬럼 인덱스
     bold_cols = {i for i, col in enumerate(df.columns) if col.startswith(BOLD_PREFIXES)}
+    # 판매가/조정판매가 열 강조 (연한 파랑)
+    sale_cols = {i for i, col in enumerate(df.columns) if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col}
+    # 마진/조정마진 열 강조 (연한 노랑)
+    margin_cols = {i for i, col in enumerate(df.columns) if (col.startswith("마진_") or col.startswith("조정마진_")) and "(₩)" in col}
 
     def highlight(row):
         styles = [''] * len(row)
 
-        # 지정 컬럼만 굵게
-        for i in bold_cols:
-            styles[i] = 'font-weight: bold'
-
-        # 마진 마이너스 → 행 전체 빨강
-        for i, col in enumerate(row.index):
-            if '마진' in col:
+        for i in range(len(row)):
+            col = row.index[i]
+            parts = []
+            # 지정 컬럼 굵게
+            if i in bold_cols:
+                parts.append('font-weight: bold')
+            # 판매가 열 배경 강조
+            if i in sale_cols:
+                parts.append('background-color: #dbeafe')
+            # 마진 열 배경 강조 (마이너스면 빨강으로 덮음)
+            if i in margin_cols:
                 try:
                     v = float(str(row[col]).replace(',', '').replace('원', ''))
                     if v < 0:
-                        return ['background-color: #fee2e2; color: #dc2626; font-weight: bold'] * len(row)
-                except:
-                    pass
-
-        # 주말/연휴 행 → 연한 노랑 (굵기 유지)
-        if '주중/주말' in row.index and row['주중/주말'] == '주말/연휴':
-            return [s + '; background-color: #fefce8' if s else 'background-color: #fefce8' for s in styles]
-
+                        parts.append('background-color: #fee2e2')
+                        parts.append('color: #dc2626')
+                    else:
+                        parts.append('background-color: #fef3c7')
+                except Exception:
+                    parts.append('background-color: #fef3c7')
+            if parts:
+                styles[i] = '; '.join(parts)
         return styles
 
     return df.style.apply(highlight, axis=1)
@@ -798,22 +860,20 @@ def main():
         ('html_blocks', 1),
         ('results', None),
         ('scroll_to_results', False),
+        ('editing_fee_idx', None),  # 수정 중인 요금표 결과 번호 (None이면 미리보기만)
+        ('is_marit', True),  # 마리트 필터 기본 체크
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
 
     # ── 파라미터 입력 (상단)
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         exchange_input = st.text_input("환율 (THB → KRW)", placeholder="예: 43.5", value="48.5")
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="")
-    with col3:
-        st.write("")
-        st.write("")
-        calc_btn = st.button("🔢 계산하기", type="primary", use_container_width=True)
 
-    # 마리트 전용 필터 옵션
+    # 마리트 전용 필터 옵션 (기본 체크됨)
     is_marit = st.checkbox(
         "마리트 (27H 제외, Night 제외)",
         help="체크하면 홀은 18H/36H만, 시간대는 Morning/Afternoon만 표시됩니다.",
@@ -842,8 +902,11 @@ def main():
                 )
             )
     with col_clear:
+        # HTML 입력칸 높이에 맞춰 약간 아래에 배치
         st.write("")
         st.write("")
+        # 계산하기 버튼 (Clear 바로 위, 같은 폭, 간격은 한 줄만)
+        calc_btn = st.button("🔢 계산하기", use_container_width=True, type="primary")
         if st.button("🗑️ Clear", use_container_width=True, help="입력/결과 전체 초기화"):
             st.session_state['html_key'] += 1
             st.session_state['result_df'] = None
@@ -951,7 +1014,7 @@ def main():
         with col_margin:
             margin_input_val = st.text_input(
                 "목표 마진율 (%)",
-                help="공급가 대비 마진 비율. 예) 10% 입력 시 → 조정공급가의 10%를 마진으로 확보. 미입력 시 마진 0 기준(손익분기)으로 계산됩니다.",
+                help="마진이 마이너스일 경우에만 적용됩니다. 공급가 대비 마진 비율(예: 10% 입력 시 조정공급가의 10%를 마진으로 확보). 미입력 시 마진 0 기준(손익분기)으로 계산됩니다.",
                 value=str(st.session_state.get('min_margin_rate', 0.0)) if st.session_state.get('min_margin_rate', 0.0) > 0 else "",
                 placeholder="미입력 시 조정마진 0 (손익분기 기준)",
                 key="margin_rate_input"
@@ -984,9 +1047,14 @@ def main():
                 st.session_state['results'] = new_results
                 st.rerun()
 
-        # ── 결과별 표시
-        for res in st.session_state.get('results', []):
-            idx = res.get("idx", 1)
+        # ── 결과별 표시 (i: 리스트 순서, idx: 결과 번호 — 아래 요금표도 고유 키/갱신 보장)
+        results_list = st.session_state.get('results') or []
+        # 위·아래 요금표 표현 형식 통일: 모든 요금표에 동일 높이 적용
+        max_fee_rows = max((len(r["df"]) for r in results_list if r.get("df") is not None), default=10)
+        fee_height = min(500, 48 + 35 * max_fee_rows)
+        fee_editor_height = min(600, 48 + 35 * max_fee_rows)
+        for i, res in enumerate(results_list):
+            idx = res.get("idx", i + 1)
             meta = res.get("meta") or {}
 
             st.markdown("---")
@@ -1009,16 +1077,13 @@ def main():
             period_esc = html.escape(period_val)
             pn_esc = html.escape(pn_text)
             pi_esc = html.escape(pi_text)
+            # 기간 / Promotion name / Promotion info 를 가로 배치 (각각 타이틀 위, 내용 아래)
             st.markdown(
-                f'<div style="margin-bottom:1rem;">'
-                f'<div style="font-size:1.5rem; color:#6b7280;">기간</div>'
-                f'<div style="font-size:1.75em;">{period_esc}</div></div>'
-                f'<div style="margin-bottom:1rem;">'
-                f'<div style="font-size:1.5rem; color:#6b7280;">Promotion name</div>'
-                f'<div style="font-size:1.75em;">{pn_esc}</div></div>'
-                f'<div style="margin-bottom:1rem;">'
-                f'<div style="font-size:1.5rem; color:#6b7280;">Promotion info</div>'
-                f'<div style="font-size:1.75em;">{pi_esc}</div></div>',
+                '<div style="display:flex; gap:2rem; margin-bottom:1rem; flex-wrap:wrap;">'
+                f'<div style="flex:1; min-width:120px;"><div style="font-size:1.5rem; color:#6b7280;">기간</div><div style="font-size:1.75em;">{period_esc}</div></div>'
+                f'<div style="flex:1; min-width:120px;"><div style="font-size:1.5rem; color:#6b7280;">Promotion name</div><div style="font-size:1.75em;">{pn_esc}</div></div>'
+                f'<div style="flex:1; min-width:120px;"><div style="font-size:1.5rem; color:#6b7280;">Promotion info</div><div style="font-size:1.75em;">{pi_esc}</div></div>'
+                '</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1028,55 +1093,84 @@ def main():
 
             df: pd.DataFrame = res["df"]
 
-            st.markdown(f"### 요금표 ({len(df)}개 항목)")
-            st.caption("판매가·조정판매가만 수정 가능합니다. 수정 시 해당 행의 공급가·마진이 자동으로 다시 계산됩니다.")
-
-            # 편집 가능 컬럼: 판매가_*, 조정판매가_* 만. 나머지는 읽기 전용
-            column_config = {}
-            for col in df.columns:
-                if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col:
-                    column_config[col] = st.column_config.NumberColumn(col, format="%d")
+            # 요금표 제목 + 수정/수정 완료 버튼(우측, 요금표와 가깝게)
+            is_editing = st.session_state.get("editing_fee_idx") == idx
+            if not is_editing:
+                st.caption("마진이 마이너스인 셀은 빨간색으로 표시됩니다.")
+            tit_col, btn_col = st.columns([11, 1])
+            with tit_col:
+                st.markdown(f"### 요금표 ({len(df)}개 항목)")
+            with btn_col:
+                if is_editing:
+                    if st.button("✅ 수정 완료", key=f"done_edit_{i}_{idx}"):
+                        st.session_state["editing_fee_idx"] = None
+                        st.rerun()
                 else:
-                    column_config[col] = st.column_config.Column(col, disabled=True)
+                    if st.button("✏️ 수정", key=f"edit_btn_{i}_{idx}"):
+                        st.session_state["editing_fee_idx"] = idx
+                        st.rerun()
 
-            edited_df = st.data_editor(
-                df,
-                key=f"fee_editor_{idx}",
-                column_config=column_config,
-                use_container_width=True,
-                height=min(600, 48 + 35 * len(df)),
-            )
+            if not is_editing:
+                display_for_style = df.copy()
+                for c in display_for_style.columns:
+                    if any(x in c for x in ['฿)', '(฿', '₩)', '(₩']):
+                        display_for_style[c] = display_for_style[c].apply(
+                            lambda x: f"{int(x):,}" if isinstance(x, (int, float)) else x
+                        )
+                styled_preview = style_df(display_for_style)
+                st.dataframe(styled_preview, use_container_width=True, height=fee_height, hide_index=True)
+            else:
+                # 수정 모드: data_editor + 수정 완료 버튼 (셀 포커스 상태에서 바로 버튼 눌러도 반영되도록 blur 스크립트는 data_editor 아래 주입)
+                st.caption("판매가·조정판매가를 수정하면 해당 행의 공급가·마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
+                column_config = {}
+                for col in df.columns:
+                    if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col:
+                        column_config[col] = st.column_config.NumberColumn(col, format="%d")
+                    else:
+                        column_config[col] = st.column_config.Column(col, disabled=True)
 
-            # 편집 후 항상 공급가·마진(·조정공급가·조정마진) 재계산, 변경 시 세션 반영
-            recalc_df = apply_price_edits(edited_df)
-            same = False
-            try:
-                if recalc_df.shape == df.shape and list(recalc_df.columns) == list(df.columns):
-                    same = True
-                    for c in df.columns:
-                        if pd.api.types.is_numeric_dtype(df[c]) and pd.api.types.is_numeric_dtype(recalc_df[c]):
-                            if not pd.to_numeric(df[c], errors="coerce").fillna(0).round(2).equals(
-                                pd.to_numeric(recalc_df[c], errors="coerce").fillna(0).round(2)
-                            ):
+                edited_df = st.data_editor(
+                    df,
+                    key=f"fee_editor_{i}_{idx}",
+                    column_config=column_config,
+                    use_container_width=True,
+                    height=fee_editor_height,
+                )
+                _inject_blur_before_done_script()
+
+                recalc_df = apply_price_edits(edited_df)
+                same = False
+                try:
+                    if recalc_df.shape == df.shape and list(recalc_df.columns) == list(df.columns):
+                        same = True
+                        for c in df.columns:
+                            if pd.api.types.is_numeric_dtype(df[c]) and pd.api.types.is_numeric_dtype(recalc_df[c]):
+                                if not pd.to_numeric(df[c], errors="coerce").fillna(0).round(2).equals(
+                                    pd.to_numeric(recalc_df[c], errors="coerce").fillna(0).round(2)
+                                ):
+                                    same = False
+                                    break
+                            elif not df[c].astype(str).eq(recalc_df[c].astype(str)).all():
                                 same = False
                                 break
-                        elif not df[c].astype(str).eq(recalc_df[c].astype(str)).all():
-                            same = False
-                            break
-            except Exception:
-                same = False
-            if not same:
-                new_results = list(st.session_state.get("results") or [])
-                for j, r in enumerate(new_results):
-                    if r.get("idx") == idx:
-                        new_results[j] = {**r, "df": recalc_df}
-                        break
-                st.session_state["results"] = new_results
-                st.rerun()
+                except Exception:
+                    same = False
+                if not same:
+                    new_results = list(st.session_state.get("results") or [])
+                    if 0 <= i < len(new_results):
+                        new_results[i] = {**new_results[i], "df": recalc_df}
+                    st.session_state["results"] = new_results
+                    st.rerun()
 
-            # CSV 다운로드 / 구글 스프레드시트 내보내기
+            # CSV 다운로드 (현재 df 기준)
+            current_df = st.session_state.get("results") or []
+            csv_df = df
+            for r in current_df:
+                if r.get("idx") == idx and r.get("df") is not None:
+                    csv_df = r["df"]
+                    break
             st.markdown("---")
-            csv = df.to_csv(index=False, encoding='utf-8-sig')
+            csv = csv_df.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
                 label="📥 CSV 다운로드",
                 data=csv,
