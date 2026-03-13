@@ -15,6 +15,21 @@ except ImportError:
 
 st.set_page_config(page_title="골프 요금 마크업 계산기", layout="wide")
 
+# 상품 유형: (value, 라디오 라벨, 구글 시트 탭 이름)
+GOLF_MODES = [
+    ("mrt", "마이리얼트립 (27H 제외, Night 제외)", "마리트 골프"),
+    ("kakao", "카카오 골프", "카카오 골프"),
+    ("triple", "트리플 골프", "트리플 골프"),
+]
+
+
+def _golf_mode_from_label(selected_label: str):
+    """선택한 라벨에서 (value, sheet_name) 반환."""
+    for value, label, sheet_name in GOLF_MODES:
+        if label == selected_label:
+            return value, sheet_name
+    return GOLF_MODES[0][0], GOLF_MODES[0][2]
+
 
 def _inject_blur_before_done_script() -> None:
     """수정 완료 버튼 클릭 시 포커스가 셀에 있어도 먼저 blur 후 클릭이 처리되도록 스크립트 주입."""
@@ -831,11 +846,11 @@ def main():
     st.title("⛳ 골프 요금 마크업 계산기")
     st.markdown("골프 요금표 HTML을 붙여넣으면 패키지 요금 + 환율 + 수수료를 자동 계산합니다.")
 
-    # 체크박스 라벨 / 버튼 스타일 살짝 키우기 (마리트 옵션 포함, 공통 버튼 스타일)
+    # 라디오·버튼 스타일
     st.markdown(
         """
         <style>
-        div[data-testid="stCheckbox"] label span {
+        div[data-testid="stRadio"] label {
             font-size: 1.05rem;
             font-weight: 600;
         }
@@ -861,7 +876,7 @@ def main():
         ('results', None),
         ('scroll_to_results', False),
         ('editing_fee_idx', None),  # 수정 중인 요금표 결과 번호 (None이면 미리보기만)
-        ('is_marit', True),  # 마리트 필터 기본 체크
+        ('golf_mode_radio', GOLF_MODES[0][1]),  # 상품 유형 라디오 선택값(라벨)
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -873,11 +888,14 @@ def main():
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="")
 
-    # 마리트 전용 필터 옵션 (기본 체크됨)
-    is_marit = st.checkbox(
-        "마리트 (27H 제외, Night 제외)",
-        help="체크하면 홀은 18H/36H만, 시간대는 Morning/Afternoon만 표시됩니다.",
-        key="is_marit",
+    # 상품 유형 선택 (라디오)
+    mode_labels = [m[1] for m in GOLF_MODES]
+    selected_label = st.radio(
+        "상품 유형",
+        options=mode_labels,
+        horizontal=True,
+        help="마이리얼트립: 27H 제외, Night 제외(18H/36H, Morning/Afternoon만). 카카오/트리플: 필터 없음.",
+        key="golf_mode_radio",
     )
 
     # ── HTML 입력 영역 (아래): 제목 → 캡션 → ➕ 추가 버튼
@@ -935,7 +953,8 @@ def main():
 
             discount_rate = 0.0
             min_margin_rate = 0.0
-            is_marit = st.session_state.get('is_marit', False)
+            _mode_val, _ = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
+            is_marit = _mode_val == "mrt"
             results = []
             total_rows = 0
             for idx, html_input in enumerate(valid_htmls, start=1):
@@ -1033,13 +1052,14 @@ def main():
                     if r.get("error") or not r.get("rows"):
                         new_results.append(r)
                         continue
+                    _mode_val, _ = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
                     df = build_table(
                         r["rows"],
                         st.session_state['exchange_rate'],
                         st.session_state['commission_rates'],
                         0.0,
                         new_margin,
-                        is_marit=st.session_state.get('is_marit', False),
+                        is_marit=(_mode_val == "mrt"),
                     )
                     rr = dict(r)
                     rr["df"] = df
@@ -1196,11 +1216,12 @@ def main():
                     else:
                         sid = raw
                     try:
+                        _, export_sheet_name = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
                         with st.spinner("구글 스프레드시트로 모든 요금표를 내보내는 중..."):
                             export_all_results_to_google_sheets(
                                 st.session_state.get("results") or [],
                                 sid,
-                                sheet_name="요금표",
+                                sheet_name=export_sheet_name,
                                 exchange_rate=st.session_state.get("exchange_rate", 0.0),
                             )
                         st.success("모든 요금표를 구글 스프레드시트로 내보냈습니다.")
