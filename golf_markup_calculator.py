@@ -105,6 +105,7 @@ def export_all_results_to_google_sheets(
     spreadsheet_id: str,
     sheet_name: str = "요금표",
     extracted_date: str | None = None,
+    exchange_rate: float = 0.0,
 ):
     """여러 개의 요금표(results 리스트)를 한 번에 내보냅니다.
 
@@ -150,7 +151,7 @@ def export_all_results_to_google_sheets(
     # 요금표 2개 이상일 때: 마지막 2개 비교 -> (key -> (A, B)) 맵. A=최신 판매가, B=이전 판매가
     increase_rate_map = {}  # key (홀, 시간대, 주중/주말) -> (A, B) then rate = (A/B - 1)*100
     sale_col = None  # 판매가 컬럼명 (첫 번째 '판매가_' 로 시작하는 컬럼)
-    num_export_cols = 23  # 기본: A~W (추출날짜까지)
+    num_export_cols = 24  # 기본: A~X (추출날짜 + 환율)
 
     if len(valid_results) >= 2:
         res1, res2 = valid_results[-2], valid_results[-1]
@@ -205,7 +206,7 @@ def export_all_results_to_google_sheets(
                     if A is not None and B is not None and B != 0:
                         rate = (A / B - 1) * 100
                         increase_rate_map[key] = (A, B, rate)
-        num_export_cols = 24  # 마지막 열에 '판매가 증가율' 추가
+        num_export_cols = 25  # 마지막 열에 '판매가 증가율' 추가 (추출날짜 + 환율 + 판매가 증가율)
 
     rows = []
     dark_sep_rows = []
@@ -241,8 +242,10 @@ def export_all_results_to_google_sheets(
             if len(row) <= 22:
                 row.extend([""] * (23 - len(row)))
             row[22] = extracted_date
-            # X열 = 판매가 증가율 (가장 최신 요금표 행에만)
-            if num_export_cols >= 24:
+            # X열 = 환율 (추출날짜 바로 뒤)
+            row.append(str(exchange_rate) if exchange_rate else "")
+            # Y열 = 판매가 증가율 (가장 최신 요금표 행에만, 요금표 2개 이상일 때)
+            if num_export_cols >= 25:
                 if is_newest_block and has_keys and increase_rate_map:
                     key = tuple(df.iloc[i][k] for k in key_cols)
                     t = increase_rate_map.get(key)
@@ -264,19 +267,25 @@ def export_all_results_to_google_sheets(
     start_cell = f"A{next_row}"
     worksheet.update(range_name=start_cell, values=rows, value_input_option="USER_ENTERED")
 
-    # 헤더 1행에 '판매가 증가율' 열이 있으면 유지, 없으면 X1에 기록 (마지막 열)
-    if num_export_cols >= 24:
+    # 헤더 1행: X1 = 환율, Y1 = 판매가 증가율(요금표 2개 이상일 때만)
+    try:
+        h = worksheet.row_values(1)
+        if len(h) < 24 or (h[23] or "").strip() != "환율":
+            worksheet.update_acell("X1", "환율")
+    except Exception:
+        worksheet.update_acell("X1", "환율")
+    if num_export_cols >= 25:
         try:
             h = worksheet.row_values(1)
-            if len(h) < 24 or (h[23] or "").strip() != "판매가 증가율":
-                worksheet.update_acell("X1", "판매가 증가율")
+            if len(h) < 25 or (h[24] or "").strip() != "판매가 증가율":
+                worksheet.update_acell("Y1", "판매가 증가율")
         except Exception:
-            worksheet.update_acell("X1", "판매가 증가율")
+            worksheet.update_acell("Y1", "판매가 증가율")
 
     def _format_rows(idxs, bg):
         if not idxs:
             return
-        last_col = "X" if num_export_cols >= 24 else "W"
+        last_col = "Y" if num_export_cols >= 25 else "X"
         for r in idxs:
             rng = f"A{r}:{last_col}{r}"
             worksheet.format(
@@ -652,6 +661,73 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
 
 
 # ─────────────────────────────────────────────
+#  요금표 편집 후 공급가/마진 재계산
+# ─────────────────────────────────────────────
+def _comm_from_col_name(col_name: str, prefix: str) -> float | None:
+    """컬럼명에서 수수료율 추출. 예: '판매가_4_0%(₩)' -> 4.0"""
+    if not col_name.startswith(prefix) or "%(₩)" not in col_name:
+        return None
+    try:
+        mid = col_name[len(prefix) : col_name.index("%(₩)")]
+        return float(mid.replace("_", ".", 1))
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
+    """판매가/조정판매가 변경분을 반영해 공급가·마진·조정공급가·조정마진을 재계산합니다.
+    조정판매가/조정공급가/조정마진은 '마진'이 음수인 행에서만 적용하고, 마진이 0 이상인 행은 0으로 둡니다.
+    """
+    out = df.copy()
+    if "패키지넷(₩)" not in out.columns:
+        return out
+    pkg_net = out["패키지넷(₩)"].astype(float, errors="ignore").fillna(0)
+
+    # 1) 판매가 → 공급가, 마진 재계산
+    for col in list(out.columns):
+        if col.startswith("판매가_") and "(₩)" in col:
+            rate = _comm_from_col_name(col, "판매가_")
+            if rate is None:
+                continue
+            suffix = col.replace("판매가_", "", 1)
+            supply_col = f"공급가_{suffix}"
+            margin_col = f"마진_{suffix}"
+            if supply_col not in out.columns or margin_col not in out.columns:
+                continue
+            sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
+            supply = (sale * (1 - rate / 100)).round()
+            out[supply_col] = supply.astype(int)
+            out[margin_col] = (supply - pkg_net).astype(int)
+
+    # 2) 조정판매가 → 조정공급가, 조정마진은 '마진'이 음수인 행에서만 적용
+    for col in list(out.columns):
+        if not col.startswith("조정판매가_") or "(₩)" not in col:
+            continue
+        rate = _comm_from_col_name(col, "조정판매가_")
+        if rate is None:
+            continue
+        suffix = col.replace("조정판매가_", "", 1)
+        margin_col = f"마진_{suffix}"
+        adj_supply_col = f"조정공급가_{suffix}"
+        adj_margin_col = f"조정마진_{suffix}"
+        if margin_col not in out.columns or adj_supply_col not in out.columns or adj_margin_col not in out.columns:
+            continue
+        margin_vals = pd.to_numeric(out[margin_col], errors="coerce").fillna(0)
+        adj_sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
+        adj_supply = (adj_sale * (1 - rate / 100)).round()
+        # 마진 < 0 인 행만 조정값 반영, 나머지는 0
+        mask_neg = margin_vals < 0
+        out[adj_supply_col] = 0
+        out.loc[mask_neg, adj_supply_col] = adj_supply.loc[mask_neg].astype(int)
+        out[adj_margin_col] = 0
+        out.loc[mask_neg, adj_margin_col] = (adj_supply.loc[mask_neg] - pkg_net.loc[mask_neg]).astype(int)
+        out[col] = 0
+        out.loc[mask_neg, col] = adj_sale.loc[mask_neg]
+
+    return out
+
+
+# ─────────────────────────────────────────────
 #  스타일
 # ─────────────────────────────────────────────
 BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '조정판매가_', '조정공급가_', '조정마진_')
@@ -729,7 +805,7 @@ def main():
     # ── 파라미터 입력 (상단)
     col1, col2, col3 = st.columns(3)
     with col1:
-        exchange_input = st.text_input("환율 (THB → KRW)", placeholder="예: 43.5", value="")
+        exchange_input = st.text_input("환율 (THB → KRW)", placeholder="예: 43.5", value="48.5")
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="")
     with col3:
@@ -953,31 +1029,50 @@ def main():
             df: pd.DataFrame = res["df"]
 
             st.markdown(f"### 요금표 ({len(df)}개 항목)")
+            st.caption("판매가·조정판매가만 수정 가능합니다. 수정 시 해당 행의 공급가·마진이 자동으로 다시 계산됩니다.")
 
-            # 숫자 컬럼 포맷팅 (표시용 복사본)
-            display_df = df.copy()
-            for col in display_df.columns:
-                if any(k in col for k in ['฿)', '(฿', '₩)', '(₩']):
-                    display_df[col] = display_df[col].apply(
-                        lambda x: f"{int(x):,}" if isinstance(x, (int, float)) else x
-                    )
+            # 편집 가능 컬럼: 판매가_*, 조정판매가_* 만. 나머지는 읽기 전용
+            column_config = {}
+            for col in df.columns:
+                if (col.startswith("판매가_") or col.startswith("조정판매가_")) and "(₩)" in col:
+                    column_config[col] = st.column_config.NumberColumn(col, format="%d")
+                else:
+                    column_config[col] = st.column_config.Column(col, disabled=True)
 
-            styled = style_df(display_df)
+            edited_df = st.data_editor(
+                df,
+                key=f"fee_editor_{idx}",
+                column_config=column_config,
+                use_container_width=True,
+                height=min(600, 48 + 35 * len(df)),
+            )
 
-            # 컬럼명 볼드 처리 CSS
-            bold_prefixes = ('판매가_', '공급가_', '마진_', '조정판매가_', '조정공급가_', '조정마진_')
-            bold_col_indices = [i for i, col in enumerate(display_df.columns) if col.startswith(bold_prefixes)]
-            if bold_col_indices:
-                css_rules = " ".join([
-                    f'div[data-testid="stDataFrame"] thead tr th:nth-child({i+2}) div {{ font-weight: 900 !important; }}'
-                    for i in bold_col_indices
-                ])
-                st.markdown(f"<style>{css_rules}</style>", unsafe_allow_html=True)
-
-            row_height_px = 35
-            header_height_px = 48
-            table_height = min(600, header_height_px + row_height_px * len(df))
-            st.dataframe(styled, use_container_width=True, height=table_height)
+            # 편집 후 항상 공급가·마진(·조정공급가·조정마진) 재계산, 변경 시 세션 반영
+            recalc_df = apply_price_edits(edited_df)
+            same = False
+            try:
+                if recalc_df.shape == df.shape and list(recalc_df.columns) == list(df.columns):
+                    same = True
+                    for c in df.columns:
+                        if pd.api.types.is_numeric_dtype(df[c]) and pd.api.types.is_numeric_dtype(recalc_df[c]):
+                            if not pd.to_numeric(df[c], errors="coerce").fillna(0).round(2).equals(
+                                pd.to_numeric(recalc_df[c], errors="coerce").fillna(0).round(2)
+                            ):
+                                same = False
+                                break
+                        elif not df[c].astype(str).eq(recalc_df[c].astype(str)).all():
+                            same = False
+                            break
+            except Exception:
+                same = False
+            if not same:
+                new_results = list(st.session_state.get("results") or [])
+                for j, r in enumerate(new_results):
+                    if r.get("idx") == idx:
+                        new_results[j] = {**r, "df": recalc_df}
+                        break
+                st.session_state["results"] = new_results
+                st.rerun()
 
             # CSV 다운로드 / 구글 스프레드시트 내보내기
             st.markdown("---")
@@ -1012,6 +1107,7 @@ def main():
                                 st.session_state.get("results") or [],
                                 sid,
                                 sheet_name="요금표",
+                                exchange_rate=st.session_state.get("exchange_rate", 0.0),
                             )
                         st.success("모든 요금표를 구글 스프레드시트로 내보냈습니다.")
                     except Exception as e:
