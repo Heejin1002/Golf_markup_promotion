@@ -216,7 +216,7 @@ def export_all_results_to_google_sheets(
             "몽키 넷(฿)",
             "몽키 세일(฿)",
             "트리플 세일(฿)",
-            "맞춤 세일(฿)",
+            "최소 마진 세일(฿)",
             "트리플 공급가(₩)",
             "몽키 넷(₩)",
             "마진(₩)",
@@ -294,7 +294,7 @@ def export_all_results_to_google_sheets(
                     _cell("몽키 넷(฿)"),
                     _cell("몽키 세일(฿)"),
                     _cell("트리플 세일(฿)"),
-                    _cell("맞춤 세일(฿)"),
+                    _cell("최소 마진 세일(฿)"),
                     _cell("트리플 공급가(₩)"),
                     _cell("몽키 넷(₩)"),
                     _cell("마진(₩)"),
@@ -743,7 +743,7 @@ def build_table(
     """
     rows: parse_golf_html 결과
     반환: DataFrame
-    - mode가 'triple'일 때: 트리플 전용 컬럼(몽키/트리플/맞춤 세일, 트리플 공급가, 마진(₩) 등)
+    - mode가 'triple'일 때: 트리플 전용 컬럼(몽키/트리플/최소 마진 세일, 트리플 공급가, 마진(₩) 등)
     - mode가 'mrt' 또는 'kakao'일 때: 참고 코드와 동일(패키지넷/패키지세일, 판매가/공급가/마진/최종*)
     """
     records = []
@@ -807,7 +807,7 @@ def build_table(
                 '몽키 넷(฿)': pkg_net,
                 '몽키 세일(฿)': pkg_sale_monkey,
                 '트리플 세일(฿)': triple_sale_thb if triple_sale_thb is not None else '-',
-                '맞춤 세일(฿)': pkg_sale,
+                '최소 마진 세일(฿)': pkg_sale,
             }
             if exchange_rate > 0:
                 rec['몽키 넷(₩)'] = pkg_net_krw
@@ -896,18 +896,18 @@ def _comm_from_col_name(col_name: str, prefix: str) -> float | None:
 
 
 def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
-    """트리플: 맞춤 세일(฿) → 트리플 공급가·마진(₩). 마이리얼트립/카카오: 판매가 → 공급가/마진/최종*."""
+    """트리플: 최소 마진 세일(฿) → 트리플 공급가·마진(₩). 마이리얼트립/카카오: 판매가 → 공급가/마진/최종*."""
     out = df.copy()
 
     # ─── 트리플 요금표 ───
-    if "맞춤 세일(฿)" in out.columns and "몽키 넷(₩)" in out.columns:
+    if "최소 마진 세일(฿)" in out.columns and "몽키 넷(₩)" in out.columns:
         pkg_net = out["몽키 넷(₩)"].astype(float, errors="ignore").fillna(0)
         try:
             triple_rate = float(st.session_state.get("triple_exchange_rate", 45.0)) or 0.0
         except Exception:
             triple_rate = 0.0
         if triple_rate > 0:
-            pkg_sale_thb = pd.to_numeric(out["맞춤 세일(฿)"], errors="coerce").fillna(0)
+            pkg_sale_thb = pd.to_numeric(out["최소 마진 세일(฿)"], errors="coerce").fillna(0)
             a_krw = (pkg_sale_thb * triple_rate).round().astype(int)
             b_krw = (a_krw * 0.95).round().astype(int)
             if "트리플 공급가(₩)" in out.columns:
@@ -998,7 +998,7 @@ BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '최종판매가_', '최
 def style_df(df):
     bold_cols = {
         i for i, col in enumerate(df.columns)
-        if col.startswith(BOLD_PREFIXES) or col == "맞춤 세일(฿)" or col == "마진(₩)"
+        if col.startswith(BOLD_PREFIXES) or col == "최소 마진 세일(฿)" or col == "마진(₩)"
     }
     sale_cols = {i for i, col in enumerate(df.columns) if (col.startswith("판매가_") or col.startswith("최종판매가_")) and "(₩)" in col}
     margin_cols = {
@@ -1073,7 +1073,7 @@ def main():
         ('html_key', 0), ('result_df', None),
         ('exchange_rate', 0.0), ('commission_rates', []),
         ('min_margin_rate', 0.0),  # 마이리얼트립/카카오용 목표 마진율
-        ('triple_sale_coef', 0.89),  # 트리플 골프 맞춤 수식 계수 (패키지세일 = 패키지넷 / (계수 * (1 - 수수료)))
+        ('triple_sale_coef', 0.89),  # 트리플 골프 최소 마진 수식 계수 (패키지세일 = 패키지넷 / (계수 * (1 - 수수료)))
         ('triple_exchange_rate', 45.0),  # 트리플 골프 전용 환율 (THB → KRW)
         ('html_blocks', 1),
         ('results', None),
@@ -1101,20 +1101,20 @@ def main():
         key="golf_mode_radio",
     )
 
-    # 트리플 골프 선택 시: 맞춤 수식 계수 입력 및 수식 안내
+    # 트리플 골프 선택 시: 최소 마진 수식 계수 입력 및 수식 안내
     if selected_label == "트리플 골프":
-        st.info("**맞춤 패키지세일(฿) = 패키지넷 ÷ (계수 × (1 - 수수료율))**")
+        st.info("**최소 마진 패키지세일(฿) = 패키지넷 ÷ (계수 × (1 - 수수료율))**")
         col_coef, col_triple_rate, _ = st.columns([1, 1, 4])
         with col_coef:
             st.number_input(
-                "맞춤 수식 계수",
+                "최소 마진 수식 계수",
                 min_value=0.01,
                 max_value=1.0,
                 value=0.89,
                 step=0.01,
                 format="%.2f",
                 key="triple_sale_coef",
-                help="패키지 세일가(맞춤 수식) 계산에 사용됩니다.",
+                help="패키지 세일가(최소 마진 수식) 계산에 사용됩니다.",
             )
         with col_triple_rate:
             st.number_input(
@@ -1377,22 +1377,22 @@ def main():
             if not is_editing:
                 display_for_style = df.copy()
                 for c in display_for_style.columns:
-                    if any(x in c for x in ['฿)', '(฿', '₩)', '(₩']) or c == '패키지세일(B, 맞춤 수식)' or c == "트리플 공급가(₩)":
+                    if any(x in c for x in ['฿)', '(฿', '₩)', '(₩']) or c == '패키지세일(B, 최소 마진 수식)' or c == "트리플 공급가(₩)":
                         display_for_style[c] = display_for_style[c].apply(
                             lambda x: f"{int(round(x)):,}" if isinstance(x, (int, float)) else x
                         )
                 styled_preview = style_df(display_for_style)
                 st.dataframe(styled_preview, use_container_width=True, height=fee_height, hide_index=True)
             else:
-                # 수정 모드: 트리플은 맞춤 세일(฿), 마이리얼트립/카카오는 판매가_* 편집 가능
+                # 수정 모드: 트리플은 최소 마진 세일(฿), 마이리얼트립/카카오는 판매가_* 편집 가능
                 _mode_val_i, _ = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
                 if _mode_val_i == "triple":
-                    st.caption("맞춤 세일(฿)을 수정하면 트리플 공급가(₩)·마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
+                    st.caption("최소 마진 세일(฿)을 수정하면 트리플 공급가(₩)·마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
                 else:
                     st.caption("판매가를 수정하면 해당 행의 공급가·마진·최종판매가·최종공급가·최종마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
                 column_config = {}
                 for col in df.columns:
-                    if col == "맞춤 세일(฿)":
+                    if col == "최소 마진 세일(฿)":
                         column_config[col] = st.column_config.NumberColumn(col, format="%d")
                     elif col.startswith("판매가_") and "(₩)" in col:
                         column_config[col] = st.column_config.NumberColumn(col, format="%d")
