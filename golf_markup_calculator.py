@@ -15,7 +15,7 @@ except ImportError:
 
 st.set_page_config(page_title="골프 요금 마크업 계산기", layout="wide")
 
-# 상품 유형: (value, 라디오 라벨, 구글 시트 탭 이름)
+# 플랫폼폼 유형: (value, 라디오 라벨, 구글 시트 탭 이름)
 GOLF_MODES = [
     ("mrt", "마이리얼트립 (27H 제외, Night 제외)", "마리트 골프"),
     ("kakao", "카카오 골프", "카카오 골프"),
@@ -1079,7 +1079,7 @@ def main():
         ('results', None),
         ('scroll_to_results', False),
         ('editing_fee_idx', None),  # 수정 중인 요금표 결과 번호 (None이면 미리보기만)
-        ('golf_mode_radio', GOLF_MODES[0][1]),  # 상품 유형 라디오 선택값(라벨)
+        ('golf_mode_radio', GOLF_MODES[0][1]),  # 플랫폼 유형 라디오 선택값(라벨)
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -1091,10 +1091,10 @@ def main():
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="")
 
-    # 상품 유형 선택 (라디오)
+    # 플랫폼 유형 선택 (라디오)
     mode_labels = [m[1] for m in GOLF_MODES]
     selected_label = st.radio(
-        "상품 유형",
+        "플랫폼 유형",
         options=mode_labels,
         horizontal=True,
         help="마이리얼트립: 27H 제외, Night 제외(18H/36H, Morning/Afternoon만). 카카오/트리플: 필터 없음.",
