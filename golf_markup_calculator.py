@@ -214,59 +214,9 @@ def export_all_results_to_google_sheets(
             continue
         valid_results.append(res)
 
-        # 요금표 2개 이상일 때: 마지막 2개 비교 -> (key -> (A, B)) 맵. A=최신 최종판매가, B=이전 최종판매가
-    increase_rate_map = {}  # key (홀, 시간대, 주중/주말) -> (A, B) then rate = (A/B - 1)*100
-    sale_col = None  # 판매가 컬럼명 (첫 번째 '판매가_' 로 시작하는 컬럼)
+        # (판매가 컬럼을 사용하지 않으므로 증가율 비교 로직은 비활성화)
+    increase_rate_map = {}
     num_export_cols = 24  # 기본: A~X (추출날짜 + 환율)
-
-    if len(valid_results) >= 2:
-        # 기간이 아니라 입력 순서를 기준으로 비교
-        # 바로 이전 요금표를 B, 가장 마지막 요금표를 A로 사용
-        res_old, res_new = valid_results[-2], valid_results[-1]
-        df_old, df_new = res_old.get("df"), res_new.get("df")
-
-        for c in df_new.columns:
-            if str(c).startswith("판매가_"):
-                sale_col = c
-                break
-        # 최종판매가가 있으면 최종판매가, 없으면 판매가 사용 (같은 수수료 컬럼 대응)
-        adj_col = None
-        if sale_col:
-            suffix = str(sale_col).replace("판매가_", "", 1)
-            adj_col = f"최종판매가_{suffix}"
-            if adj_col not in df_new.columns or adj_col not in df_old.columns:
-                adj_col = None
-
-        def _price_for_row(dframe, i, sale_c, adj_c):
-            if adj_c and adj_c in dframe.columns:
-                try:
-                    v = float(dframe.iloc[i][adj_c])
-                    if v and v > 0:
-                        return v
-                except (TypeError, ValueError):
-                    pass
-            try:
-                return float(dframe.iloc[i][sale_c]) if sale_c in dframe.columns else None
-            except (TypeError, ValueError):
-                return None
-
-        if sale_col and sale_col in df_old.columns and sale_col in df_new.columns:
-            key_cols = ["홀", "시간대", "주중/주말"]
-            if all(k in df_old.columns and k in df_new.columns for k in key_cols):
-                old_by_key = {}
-                for i in range(len(df_old)):
-                    key = tuple(df_old.iloc[i][k] for k in key_cols)
-                    p = _price_for_row(df_old, i, sale_col, adj_col)
-                    if p is not None:
-                        old_by_key[key] = p
-                for i in range(len(df_new)):
-                    key = tuple(df_new.iloc[i][k] for k in key_cols)
-                    A = _price_for_row(df_new, i, sale_col, adj_col)
-                    B = old_by_key.get(key)
-                    if A is not None and B is not None and B != 0:
-                        rate = (A / B - 1) * 100
-                        increase_rate_map[key] = (A, B, rate)
-        num_export_cols = 25  # 마지막 열에 '판매가 증가율' 추가 (추출날짜 + 환율 + 판매가 증가율)
 
     rows = []
     dark_sep_rows = []
@@ -621,10 +571,21 @@ def _extract_status(html_block: str, name_pattern: str):
     return None
 
 
-def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin_rate=0.0, is_marit: bool = False):
+def build_table(
+    rows,
+    exchange_rate,
+    commission_rates,
+    discount_rate,
+    is_marit: bool = False,
+    mode: str = "",
+    triple_sale_coef: float = 0.89,
+    triple_exchange_rate: float = 0.0,
+):
     """
     rows: parse_golf_html 결과
     반환: DataFrame
+    트리플 모드일 때는 triple_exchange_rate(트리플 정산 환율)를 사용해 보조 지표를 계산하고,
+    기본 원화 계산은 입력 환율(exchange_rate)을 그대로 사용합니다.
     """
     records = []
 
@@ -649,9 +610,20 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
 
         # 패키지 총 넷가, 세일가
         pkg_net = net_thb + caddy_net + cart_net
-        pkg_sale = sale_thb + caddy_sale + cart_sale
+        # 몽키 패키지세일: 다른 상품 유형과 동일하게 HTML에서 온 값 합계
+        pkg_sale_monkey = sale_thb + caddy_sale + cart_sale
+        # 맞춤/기본 패키지세일: 트리플일 때는 맞춤 수식, 아니면 몽키와 동일
+        pkg_sale = pkg_sale_monkey
 
-        # 원화 환산
+        # 트리플 골프 모드일 때: 맞춤 패키지세일(맞춤 수식) = 패키지넷 / (계수 * (1 - 수수료))
+        # 수수료는 입력된 commission_rates 중 첫 번째 값 사용, 없으면 0%
+        if mode == "triple":
+            base_comm = float(commission_rates[0]) / 100.0 if commission_rates else 0.0
+            denom = triple_sale_coef * (1 - base_comm)
+            if denom > 0:
+                pkg_sale = round(pkg_net / denom)  # 맞춤 패키지세일(맞춤 수식)
+
+        # 원화 환산 (맞춤/기본 패키지세일 기준, 입력 환율 사용)
         pkg_sale_krw = round(pkg_sale * exchange_rate) if exchange_rate > 0 else 0
         pkg_net_krw = round(pkg_net * exchange_rate) if exchange_rate > 0 else 0
 
@@ -659,6 +631,20 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
         cart_status = r.get('cart_status')
         caddy_include = caddy_status in ('Include', 'Compulsory') if caddy_status else False
         cart_include = cart_status in ('Include', 'Compulsory') if cart_status else False
+
+        # 트리플 세일(฿): 몽키 세일(฿) × (입력 환율 / 트리플 환율)
+        triple_sale_thb = None
+        if mode == "triple":
+            try:
+                _base_rate = float(exchange_rate) or 0.0
+            except Exception:
+                _base_rate = 0.0
+            try:
+                _triple_rate = float(triple_exchange_rate) or 0.0
+            except Exception:
+                _triple_rate = 0.0
+            if _base_rate > 0 and _triple_rate > 0:
+                triple_sale_thb = round(pkg_sale_monkey * _base_rate / _triple_rate)
 
         rec = {
             '홀': hole,
@@ -668,58 +654,34 @@ def build_table(rows, exchange_rate, commission_rates, discount_rate, min_margin
             '그린피(세일, ฿)': sale_thb,
             '캐디피(넷, ฿)': caddy_net,
             '카트피(넷, ฿)': cart_net,
-            '패키지넷(฿)': pkg_net,
-            '패키지세일(฿)': pkg_sale,
             '캐디 포함': '✅ ' + (caddy_status or '') if caddy_include else (caddy_status or '-'),
             '카트 포함': '✅ ' + (cart_status or '') if cart_include else (cart_status or '-'),
+            '몽키 넷(฿)': pkg_net,
+            '몽키 세일(฿)': pkg_sale_monkey,
+            '트리플 세일(฿)': triple_sale_thb if triple_sale_thb is not None else '-',
+            '맞춤 세일(฿)' if mode == "triple" else '패키지세일(฿)': pkg_sale,
         }
+
+        # 트리플 모드일 때: B 보조 지표 계산
+        # B = (맞춤 세일(฿) × 트리플 환율) × 0.95 (정산 5% 공제)
+        if mode == "triple" and triple_exchange_rate:
+            try:
+                a_krw = float(pkg_sale) * float(triple_exchange_rate)
+                b_krw = int(round(a_krw * 0.95))
+            except Exception:
+                b_krw = 0
+            rec["트리플 공급가(₩)"] = b_krw
 
         # 원화 환산
         if exchange_rate > 0:
-            rec['패키지넷(₩)'] = pkg_net_krw
-            rec['패키지세일(₩)'] = pkg_sale_krw
+            rec['몽키 넷(₩)'] = pkg_net_krw
 
-        # 수수료별 계산
-        discount = discount_rate / 100
-        for comm in commission_rates:
-            comm_d = comm / 100
-            comm_str = str(comm).replace('.', '_')
-
-            # 기본 판매가/공급가/마진
-            base_price_krw = pkg_sale_krw
-            base_supply_krw = round(base_price_krw * (1 - comm_d)) if exchange_rate > 0 else 0
-            base_margin_krw = base_supply_krw - pkg_net_krw
-
-            # 최종 판매가/공급가/마진 역산 (목표 마진율이 있고, 현재 마진이 0 이하인 경우에만 상향 조정)
-            margin_pct = min_margin_rate / 100.0 if min_margin_rate is not None else 0.0
-            need_adjust = (
-                (base_margin_krw <= 0)
-                and exchange_rate > 0
-                and (1 - comm_d) > 0
-                and margin_pct < 1.0
-            )
-            if need_adjust:
-                # 최종공급가 = 패키지넷 / (1 - 목표마진율%)  → 공급가 대비 마진 비율
-                final_supply_krw = math.ceil(pkg_net_krw / (1 - margin_pct))
-                # 최종판매가 = 최종공급가 ÷ (1 - 수수료율)
-                final_price_krw = math.ceil(final_supply_krw / (1 - comm_d))
-                # 최종마진 = 최종공급가 - 패키지넷(₩)
-                final_margin_krw = final_supply_krw - pkg_net_krw
-            else:
-                # 마진이 0 초과이면 기본값 그대로 최종값으로 사용
-                final_price_krw = base_price_krw
-                final_supply_krw = base_supply_krw
-                final_margin_krw = base_margin_krw
-
-            if exchange_rate > 0:
-                # 기본 판매가/공급가/마진
-                rec[f'판매가_{comm_str}%(₩)'] = base_price_krw
-                rec[f'공급가_{comm_str}%(₩)'] = base_supply_krw
-                rec[f'마진_{comm_str}%(₩)'] = base_margin_krw
-                # 최종 판매가/공급가/마진 (마진<0이면 조정값, 마진≥0이면 기본값 복사)
-                rec[f'최종판매가_{comm_str}%(₩)'] = final_price_krw
-                rec[f'최종공급가_{comm_str}%(₩)'] = final_supply_krw
-                rec[f'최종마진_{comm_str}%(₩)'] = final_margin_krw
+        # 마진(₩): 트리플 공급가(₩) - 몽키 넷(₩)
+        if exchange_rate > 0 and "트리플 공급가(₩)" in rec:
+            try:
+                rec["마진(₩)"] = int(rec["트리플 공급가(₩)"]) - int(pkg_net_krw)
+            except Exception:
+                rec["마진(₩)"] = 0
 
         records.append(rec)
 
@@ -741,100 +703,69 @@ def _comm_from_col_name(col_name: str, prefix: str) -> float | None:
 
 
 def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
-    """판매가 변경분을 반영해 공급가·마진·최종공급가·최종마진을 재계산합니다.
+    """판매가·맞춤 세일(฿) 변경분을 반영해 트리플 공급가·마진을 재계산합니다.
 
-    - 판매가_: 기본 공급가/마진 재계산
-    - 최종판매가_/최종공급가_/최종마진_은 판매가/공급가/마진과 목표 마진율에 따라 자동 계산
+    - 맞춤 세일(฿) 편집 시: 트리플 공급가(₩) 및 마진(₩) 연쇄 반영
+    - 최종판매가_/최종공급가_/최종마진_ 관련 로직은 제거 (컬럼도 생성하지 않음)
     """
     out = df.copy()
-    if "패키지넷(₩)" not in out.columns:
+    if "몽키 넷(₩)" not in out.columns:
         return out
-    pkg_net = out["패키지넷(₩)"].astype(float, errors="ignore").fillna(0)
+    pkg_net = out["몽키 넷(₩)"].astype(float, errors="ignore").fillna(0)
 
-    # 1) 판매가 → 공급가, 마진 재계산
-    for col in list(out.columns):
-        if col.startswith("판매가_") and "(₩)" in col:
-            rate = _comm_from_col_name(col, "판매가_")
-            if rate is None:
-                continue
-            suffix = col.replace("판매가_", "", 1)
-            supply_col = f"공급가_{suffix}"
-            margin_col = f"마진_{suffix}"
-            if supply_col not in out.columns or margin_col not in out.columns:
-                continue
-            sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
-            supply = (sale * (1 - rate / 100)).round()
-            out[supply_col] = supply.astype(int)
-            out[margin_col] = (supply - pkg_net).astype(int)
+    # 0) 맞춤 세일(฿) 편집 시 → 트리플 공급가 갱신
+    if "맞춤 세일(฿)" in out.columns:
+        try:
+            triple_rate = float(st.session_state.get("triple_exchange_rate", 45.0)) or 0.0
+        except Exception:
+            triple_rate = 0.0
+        try:
+            base_rate = float(st.session_state.get("exchange_rate", 0.0)) or 0.0
+        except Exception:
+            base_rate = 0.0
+        if triple_rate > 0:
+            pkg_sale_thb = pd.to_numeric(out["맞춤 세일(฿)"], errors="coerce").fillna(0)
+            # A/B/C: 트리플 정산 환율과 입력 환율을 함께 사용
+            a_krw = (pkg_sale_thb * triple_rate).round().astype(int)
+            b_krw = (a_krw * 0.95).round().astype(int)
+            c_thb = b_krw
+            if base_rate > 0:
+                c_thb = (b_krw / base_rate).round().astype(int)
+            if "트리플 공급가(₩)" in out.columns:
+                out["트리플 공급가(₩)"] = b_krw
+    # 1) 마진(₩) 재계산: 트리플 공급가(₩) - 몽키 넷(₩)
+    if "마진(₩)" in out.columns and "트리플 공급가(₩)" in out.columns:
+        triple_supply = pd.to_numeric(out["트리플 공급가(₩)"], errors="coerce").fillna(0)
+        out["마진(₩)"] = (triple_supply - pkg_net).round().astype(int)
 
-    # 2) 판매가/공급가/마진 + 목표 마진율 → 최종판매가/최종공급가/최종마진 재계산
-    try:
-        margin_pct = float(st.session_state.get("min_margin_rate", 0.0)) / 100.0
-    except Exception:
-        margin_pct = 0.0
-    for col in list(out.columns):
-        if not col.startswith("판매가_") or "(₩)" not in col:
-            continue
-        rate = _comm_from_col_name(col, "판매가_")
-        if rate is None:
-            continue
-        suffix = col.replace("판매가_", "", 1)
-        supply_col = f"공급가_{suffix}"
-        margin_col = f"마진_{suffix}"
-        final_sale_col = f"최종판매가_{suffix}"
-        final_supply_col = f"최종공급가_{suffix}"
-        final_margin_col = f"최종마진_{suffix}"
-        if (
-            supply_col not in out.columns
-            or margin_col not in out.columns
-            or final_sale_col not in out.columns
-            or final_supply_col not in out.columns
-            or final_margin_col not in out.columns
-        ):
-            continue
-        base_sale = pd.to_numeric(out[col], errors="coerce").fillna(0)
-        base_supply = pd.to_numeric(out[supply_col], errors="coerce").fillna(0)
-        base_margin = pd.to_numeric(out[margin_col], errors="coerce").fillna(0)
-
-        # 기본값을 우선 복사
-        final_sale = base_sale.copy()
-        final_supply = base_supply.copy()
-        final_margin = base_margin.copy()
-
-        # 마진이 0 이하이고 목표 마진율이 유효하면 최종값 상향 조정
-        if margin_pct > 0.0 and margin_pct < 1.0:
-            mask = base_margin <= 0
-            if mask.any():
-                target_supply = (pkg_net / (1 - margin_pct)).apply(
-                    lambda x: int(math.ceil(x)) if pd.notna(x) else 0
-                )
-                target_sale = (target_supply / (1 - rate / 100.0)).apply(
-                    lambda x: int(math.ceil(x)) if pd.notna(x) else 0
-                )
-                target_margin = target_supply - pkg_net
-                final_sale[mask] = target_sale[mask]
-                final_supply[mask] = target_supply[mask]
-                final_margin[mask] = target_margin[mask]
-
-        out[final_sale_col] = final_sale.astype(int)
-        out[final_supply_col] = final_supply.astype(int)
-        out[final_margin_col] = final_margin.astype(int)
-
+    # 2단계: 최종판매가_/최종공급가_/최종마진_ 관련 로직은 사용하지 않으므로 제거
     return out
 
 
 # ─────────────────────────────────────────────
 #  스타일
 # ─────────────────────────────────────────────
-BOLD_PREFIXES = ('판매가_', '공급가_', '마진_', '최종판매가_', '최종공급가_', '최종마진_')
+BOLD_PREFIXES = ('마진_',)
 
 def style_df(df):
-    # 볼드 처리할 컬럼 인덱스
-    bold_cols = {i for i, col in enumerate(df.columns) if col.startswith(BOLD_PREFIXES)}
-    # 판매가/최종판매가 열 강조 (연한 파랑)
-    sale_cols = {i for i, col in enumerate(df.columns) if (col.startswith("판매가_") or col.startswith("최종판매가_")) and "(₩)" in col}
+    # 볼드 처리할 컬럼 인덱스 (맞춤 세일 포함)
+    bold_cols = {
+        i for i, col in enumerate(df.columns)
+        if col.startswith(BOLD_PREFIXES) or col == "맞춤 세일(฿)" or col == "마진(₩)"
+    }
     # 마진/최종마진 열 강조 (연한 노랑)
-    margin_cols = {i for i, col in enumerate(df.columns) if (col.startswith("마진_") or col.startswith("최종마진_")) and "(₩)" in col}
+    margin_cols = {
+        i
+        for i, col in enumerate(df.columns)
+        if ((col.startswith("마진_") or col.startswith("최종마진_")) and "(₩)" in col) or col == "마진(₩)"
+    }
+
+    # 트리플 공급가(₩) 오른쪽에 굵은 구분선 추가
+    divider_col = None
+    for i, col in enumerate(df.columns):
+        if col == "트리플 공급가(₩)":
+            divider_col = i
+            break
 
     def highlight(row):
         styles = [''] * len(row)
@@ -845,9 +776,6 @@ def style_df(df):
             # 지정 컬럼 굵게
             if i in bold_cols:
                 parts.append('font-weight: bold')
-            # 판매가 열 배경 강조
-            if i in sale_cols:
-                parts.append('background-color: #dbeafe')
             # 마진 열 배경 강조 (마이너스면 빨강으로 덮음)
             if i in margin_cols:
                 try:
@@ -859,6 +787,9 @@ def style_df(df):
                         parts.append('background-color: #fef3c7')
                 except Exception:
                     parts.append('background-color: #fef3c7')
+            # 트리플 공급가(₩) 바로 오른쪽에 굵은 구분선
+            if divider_col is not None and i == divider_col:
+                parts.append('border-right: 3px solid #000')
             if parts:
                 styles[i] = '; '.join(parts)
         return styles
@@ -898,7 +829,9 @@ def main():
     for key, default in [
         ('html_key', 0), ('result_df', None),
         ('exchange_rate', 0.0), ('commission_rates', []),
-        ('min_margin_rate', 0.0),
+        # ('min_margin_rate', 0.0),  # 목표 마진율 기능 제거
+        ('triple_sale_coef', 0.89),  # 트리플 골프 맞춤 수식 계수 (패키지세일 = 패키지넷 / (계수 * (1 - 수수료)))
+        ('triple_exchange_rate', 45.0),  # 트리플 골프 전용 환율 (THB → KRW)
         ('html_blocks', 1),
         ('results', None),
         ('scroll_to_results', False),
@@ -924,6 +857,32 @@ def main():
         help="마이리얼트립: 27H 제외, Night 제외(18H/36H, Morning/Afternoon만). 카카오/트리플: 필터 없음.",
         key="golf_mode_radio",
     )
+
+    # 트리플 골프 선택 시: 맞춤 수식 계수 입력 및 수식 안내
+    if selected_label == "트리플 골프":
+        st.info("**맞춤 패키지세일(฿) = 패키지넷 ÷ (계수 × (1 - 수수료율))**")
+        col_coef, col_triple_rate, _ = st.columns([1, 1, 4])
+        with col_coef:
+            st.number_input(
+                "맞춤 수식 계수",
+                min_value=0.01,
+                max_value=1.0,
+                value=0.89,
+                step=0.01,
+                format="%.2f",
+                key="triple_sale_coef",
+                help="패키지 세일가(맞춤 수식) 계산에 사용됩니다.",
+            )
+        with col_triple_rate:
+            st.number_input(
+                "트리플 환율 (THB → KRW)",
+                min_value=0.0,
+                value=45.0,
+                step=0.1,
+                format="%.1f",
+                key="triple_exchange_rate",
+                help="트리플 골프 요금표 원화 환산에 사용됩니다.",
+            )
 
     # ── HTML 입력 영역 (아래): 제목 → 캡션 → ➕ 추가 버튼
     st.markdown("### 골프 요금표 HTML 붙여넣기")
@@ -956,7 +915,7 @@ def main():
             st.session_state['html_key'] += 1
             st.session_state['result_df'] = None
             st.session_state['results'] = None
-            st.session_state['min_margin_rate'] = 0.0
+            # st.session_state['min_margin_rate'] = 0.0  # 목표 마진율 기능 제거
             st.session_state['html_blocks'] = 1
             st.rerun()
 
@@ -998,7 +957,16 @@ def main():
                     })
                     continue
 
-                df = build_table(rows, exchange_rate, commission_rates, 0.0, min_margin_rate, is_marit=is_marit)
+                df = build_table(
+                    rows,
+                    exchange_rate,
+                    commission_rates,
+                    0.0,
+                    is_marit=is_marit,
+                    mode=_mode_val,
+                    triple_sale_coef=st.session_state.get("triple_sale_coef", 0.89),
+                    triple_exchange_rate=float(st.session_state.get("triple_exchange_rate", 45.0)) or 0.0,
+                )
                 total_rows += len(rows)
                 results.append({
                     "idx": idx,
@@ -1013,7 +981,7 @@ def main():
             st.session_state['result_df'] = None  # 단일 DF 경로는 사용하지 않음(호환용 키)
             st.session_state['exchange_rate'] = exchange_rate
             st.session_state['commission_rates'] = commission_rates
-            st.session_state['min_margin_rate'] = min_margin_rate
+            # st.session_state['min_margin_rate'] = min_margin_rate  # 목표 마진율 기능 제거
             st.session_state['scroll_to_results'] = True
             st.success(f"✅ 총 {len(valid_htmls)}개 HTML 처리 완료! (파싱된 요금 항목 합계: {total_rows}개)")
             st.rerun()
@@ -1022,7 +990,7 @@ def main():
     if st.session_state.get('results'):
         exchange_rate = st.session_state['exchange_rate']
         commission_rates = st.session_state['commission_rates']
-        min_margin_rate = st.session_state.get('min_margin_rate', 0.0)
+        min_margin_rate = 0.0
 
         # 결과 영역 앵커 + 계산하기 직후면 여기로 스크롤 (components.html로 스크립트 실행)
         st.markdown('<div id="result-section"></div>', unsafe_allow_html=True)
@@ -1048,51 +1016,14 @@ def main():
         st.markdown("**상품명**")
         st.markdown(f'<div style="font-size:3rem; margin-bottom:1.5rem;">{pname_esc}</div>', unsafe_allow_html=True)
 
-        # 설정 요약 (공통)
+        # 설정 요약 (공통, 트리플일 때는 트리플 정산 환율 표시)
+        _mode_val, _ = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
+        display_rate = float(st.session_state.get("triple_exchange_rate", 45.0)) or 0.0 if _mode_val == "triple" else exchange_rate
+        rate_label = "환율 (트리플 정산)" if _mode_val == "triple" else "환율"
         c1, c2, c3 = st.columns(3)
-        c1.metric("환율", f"1 THB = {exchange_rate:,.2f} KRW" if exchange_rate > 0 else "미설정")
+        c1.metric(rate_label, f"1 THB = {display_rate:,.2f} KRW" if display_rate > 0 else "미설정")
         c2.metric("수수료", ", ".join([f"{x}%" for x in commission_rates]) if commission_rates else "미설정")
-        c3.metric("목표 마진율", f"{min_margin_rate:.2f}%" if min_margin_rate and min_margin_rate > 0 else "미설정")
-
-        # ── 목표 마진율 입력 (결과 상단, 전체 결과에 적용)
-        st.markdown("### 마진 설정")
-        col_margin, col_apply = st.columns([2, 1])
-        with col_margin:
-            margin_input_val = st.text_input(
-                "목표 마진율 (%)",
-                help="마진이 마이너스일 경우에만 적용됩니다. 공급가 대비 마진 비율(예: 10% 입력 시 조정공급가의 10%를 마진으로 확보). 미입력 시 마진 0 기준(손익분기)으로 계산됩니다.",
-                value=str(st.session_state.get('min_margin_rate', 0.0)) if st.session_state.get('min_margin_rate', 0.0) > 0 else "",
-                placeholder="미입력 시 조정마진 0 (손익분기 기준)",
-                key="margin_rate_input"
-            )
-        with col_apply:
-            st.write("　")
-            if st.button("✅ 마진율 적용", use_container_width=True):
-                try:
-                    new_margin = float(margin_input_val.strip()) if margin_input_val.strip() else 0.0
-                except:
-                    new_margin = 0.0
-                st.session_state['min_margin_rate'] = new_margin
-                # 각 HTML 결과를 다시 계산
-                new_results = []
-                for r in st.session_state.get('results', []):
-                    if r.get("error") or not r.get("rows"):
-                        new_results.append(r)
-                        continue
-                    _mode_val, _ = _golf_mode_from_label(st.session_state.get("golf_mode_radio", GOLF_MODES[0][1]))
-                    df = build_table(
-                        r["rows"],
-                        st.session_state['exchange_rate'],
-                        st.session_state['commission_rates'],
-                        0.0,
-                        new_margin,
-                        is_marit=(_mode_val == "mrt"),
-                    )
-                    rr = dict(r)
-                    rr["df"] = df
-                    new_results.append(rr)
-                st.session_state['results'] = new_results
-                st.rerun()
+        c3.empty()
 
         # ── 결과별 표시 (i: 리스트 순서, idx: 결과 번호 — 아래 요금표도 고유 키/갱신 보장)
         results_list = st.session_state.get('results') or []
@@ -1160,18 +1091,18 @@ def main():
             if not is_editing:
                 display_for_style = df.copy()
                 for c in display_for_style.columns:
-                    if any(x in c for x in ['฿)', '(฿', '₩)', '(₩']):
+                    if any(x in c for x in ['฿)', '(฿', '₩)', '(₩']) or c == '패키지세일(B, 맞춤 수식)' or c == "트리플 공급가(₩)":
                         display_for_style[c] = display_for_style[c].apply(
-                            lambda x: f"{int(x):,}" if isinstance(x, (int, float)) else x
+                            lambda x: f"{int(round(x)):,}" if isinstance(x, (int, float)) else x
                         )
                 styled_preview = style_df(display_for_style)
                 st.dataframe(styled_preview, use_container_width=True, height=fee_height, hide_index=True)
             else:
                 # 수정 모드: data_editor + 수정 완료 버튼 (셀 포커스 상태에서 바로 버튼 눌러도 반영되도록 blur 스크립트는 data_editor 아래 주입)
-                st.caption("판매가를 수정하면 해당 행의 공급가·마진·최종판매가·최종공급가·최종마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
+                st.caption("맞춤 세일(฿)을 수정하면 트리플 공급가(₩)·마진이 자동으로 다시 계산됩니다. 셀 수정 후 바로 수정 완료를 눌러도 반영됩니다(잠시 후 처리).")
                 column_config = {}
                 for col in df.columns:
-                    if col.startswith("판매가_") and "(₩)" in col:
+                    if col == "맞춤 세일(฿)":
                         column_config[col] = st.column_config.NumberColumn(col, format="%d")
                     else:
                         column_config[col] = st.column_config.Column(col, disabled=True)
