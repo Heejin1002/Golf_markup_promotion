@@ -202,6 +202,7 @@ def parse_rate_json(rate_json_raw, currency: str = "THB") -> list[dict]:
                     continue
 
                 net_thb = _num(time_data.get("nett"))
+                # sale 필드가 dict가 아닐 수 있으므로 _safe_get 사용
                 # sale.monkey에서 currency에 맞는 값 읽기 (THB, USD 모두 지원)
                 sale_monkey = _safe_get(time_data, "sale", "monkey") or {}
                 if isinstance(sale_monkey, dict):
@@ -644,14 +645,9 @@ def parse_golf_html(html: str):
 
             for week_div in ('weekday', 'weekend'):
                 net_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.nett"'
+                sale_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.sale\.monkey\.THB"'
                 net_val = _extract_val(tb, net_key)
-                # THB, USD 순서로 시도
-                sale_val = None
-                for curr in ("THB", "USD"):
-                    sale_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.sale\.monkey\.{curr}"'
-                    sale_val = _extract_val(tb, sale_key)
-                    if sale_val:
-                        break
+                sale_val = _extract_val(tb, sale_key)
 
                 if (sale_val is None or sale_val == 0) and (net_val is None or net_val == 0):
                     continue
@@ -931,26 +927,20 @@ def _comm_from_col_name(col_name: str, prefix: str) -> float | None:
         return None
 
 
-def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
+def apply_price_edits(df: pd.DataFrame, triple_exchange_rate: float = 0.0) -> pd.DataFrame:
     out = df.copy()
 
     if "최소 마진 세일(฿)" in out.columns and "몽키 넷(₩)" in out.columns:
-        pkg_net = out["몽키 넷(₩)"].astype(float, errors="ignore").fillna(0)
+        pkg_net = pd.to_numeric(out["몽키 넷(₩)"], errors="coerce").fillna(0)
         try:
-            triple_rate = float(st.session_state.get("triple_exchange_rate", 45.0)) or 0.0
+            _comm_rates = st.session_state.get("commission_rates") or []
+            _first_comm = float(_comm_rates[0]) / 100.0 if _comm_rates else 0.05
         except Exception:
-            triple_rate = 0.0
-        if triple_rate > 0:
+            _first_comm = 0.05
+        if "트리플 공급가(₩)" in out.columns and triple_exchange_rate > 0:
             pkg_sale_thb = pd.to_numeric(out["최소 마진 세일(฿)"], errors="coerce").fillna(0)
-            a_krw = (pkg_sale_thb * triple_rate).round().astype(int)
-            try:
-                _comm_rates = st.session_state.get("commission_rates") or []
-                _first_comm = float(_comm_rates[0]) / 100.0 if _comm_rates else 0.05
-            except Exception:
-                _first_comm = 0.05
-            b_krw = (a_krw * (1 - _first_comm)).round().astype(int)
-            if "트리플 공급가(₩)" in out.columns:
-                out["트리플 공급가(₩)"] = b_krw
+            a_krw = (pkg_sale_thb * triple_exchange_rate).round().astype(int)
+            out["트리플 공급가(₩)"] = (a_krw * (1 - _first_comm)).round().astype(int)
         if "마진(₩)" in out.columns and "트리플 공급가(₩)" in out.columns:
             triple_supply = pd.to_numeric(out["트리플 공급가(₩)"], errors="coerce").fillna(0)
             out["마진(₩)"] = (triple_supply - pkg_net).round().astype(int)
@@ -1160,7 +1150,7 @@ def search_tab_ui():
         col_exr, col_comm, _ = st.columns([1, 1, 2])
 
     with col_exr:
-        exr_str = st.text_input("환율 (THB or USD → KRW)", value="48.5", key="stab_exr")
+        exr_str = st.text_input("환율 (THB→KRW)", value="48.5", key="stab_exr")
     with col_comm:
         comm_str = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", key="stab_comm")
 
@@ -1233,7 +1223,8 @@ def search_tab_ui():
                 commission_rates = []
 
         mode_val, _ = _golf_mode_from_label(sel_mode)
-        built = st.session_state.get("stab_built") or {}
+        built = {}  # 새 계산 시 기존 결과 초기화
+        st.session_state["stab_editing_idx"] = None  # 수정 모드 초기화
 
         for idx_s, src in enumerate(src_list):
             gid = str(src.get("id") or "")
@@ -1257,7 +1248,7 @@ def search_tab_ui():
                 "product_name":   {"en": selected["name_en"], "ko": selected["name_ko"]},
                 "city_ko":         selected.get("city_ko") or "",
             }
-            built[gid] = {"df": df, "meta": meta, "rows": rows, "exchange_rate": exchange_rate, "commission_rates": commission_rates}
+            built[gid] = {"df": df, "meta": meta, "rows": rows, "exchange_rate": exchange_rate, "commission_rates": commission_rates, "triple_exchange_rate": triple_exr}
 
         st.session_state["stab_built"] = built
 
@@ -1347,7 +1338,8 @@ def search_tab_ui():
             edited_df = st.data_editor(df, key=f"stab_editor_{gid_key}_{i}", column_config=column_config, use_container_width=True, height=fee_editor_height)
             _inject_blur_before_done_script()
 
-            recalc_df = apply_price_edits(edited_df)
+            _res_triple_exr = res.get("triple_exchange_rate") or 0.0
+            recalc_df = apply_price_edits(edited_df, triple_exchange_rate=_res_triple_exr)
             same = False
             try:
                 if recalc_df.shape == df.shape and list(recalc_df.columns) == list(df.columns):
@@ -1421,7 +1413,7 @@ def html_tab_ui():
 
     col1, col2 = st.columns(2)
     with col1:
-        exchange_input = st.text_input("환율 (THB or USD → KRW)", placeholder="예: 43.5", value="48.5", key="html_exr")
+        exchange_input = st.text_input("환율 (THB → KRW)", placeholder="예: 43.5", value="48.5", key="html_exr")
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="", key="html_comm")
 
@@ -1665,7 +1657,8 @@ def html_tab_ui():
                 edited_df = st.data_editor(df, key=f"fee_editor_{i}_{idx}", column_config=column_config, use_container_width=True, height=fee_editor_height)
                 _inject_blur_before_done_script()
 
-                recalc_df = apply_price_edits(edited_df)
+                _html_triple_exr = float(st.session_state.get("triple_exchange_rate", 0.0)) or 0.0
+                recalc_df = apply_price_edits(edited_df, triple_exchange_rate=_html_triple_exr)
                 same = False
                 try:
                     if recalc_df.shape == df.shape and list(recalc_df.columns) == list(df.columns):
