@@ -111,6 +111,19 @@ def fetch_golf_rates_by_product(product_id: int) -> list[dict]:
 
 
 # =============================================================================
+# 안전한 중첩 dict 접근 헬퍼
+# =============================================================================
+
+def _safe_get(obj, *keys):
+    """중첩 dict에서 안전하게 값을 꺼냅니다. 중간에 dict가 아닌 값이 있으면 None 반환."""
+    for k in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(k)
+    return obj
+
+
+# =============================================================================
 # rateJson → build_table() 용 rows 변환
 # =============================================================================
 
@@ -152,10 +165,12 @@ def parse_rate_json(rate_json_raw) -> list[dict]:
 
         caddy_h   = caddy_sec.get(hole) or {}
         cart_h    = cart_sec.get(hole)  or {}
-        caddy_net = _num(caddy_h.get("nett"))
-        caddy_thb = _num((caddy_h.get("sale") or {}).get("THB"))
-        cart_net  = _num(cart_h.get("nett"))
-        cart_thb  = _num((cart_h.get("sale") or {}).get("THB"))
+
+        # _safe_get 으로 중간 타입이 dict가 아닌 경우 안전하게 처리
+        caddy_net = _num(_safe_get(caddy_h, "nett"))
+        caddy_thb = _num(_safe_get(caddy_h, "sale", "THB"))
+        cart_net  = _num(_safe_get(cart_h,  "nett"))
+        cart_thb  = _num(_safe_get(cart_h,  "sale", "THB"))
 
         for time_of_day in TIME_SLOTS:
             wd_t = wd_hole.get(time_of_day)
@@ -176,7 +191,8 @@ def parse_rate_json(rate_json_raw) -> list[dict]:
                     continue
 
                 net_thb = _num(time_data.get("nett"))
-                sale_mk = _num((time_data.get("sale") or {}).get("monkey", {}).get("THB"))
+                # sale 필드가 dict가 아닐 수 있으므로 _safe_get 사용
+                sale_mk = _num(_safe_get(time_data, "sale", "monkey", "THB"))
 
                 if net_thb == 0 and sale_mk == 0:
                     continue
@@ -817,7 +833,7 @@ def build_table(
             if triple_exchange_rate:
                 try:
                     a_krw = float(pkg_sale) * float(triple_exchange_rate)
-                    b_krw = int(round(a_krw * 0.95))
+                    b_krw = int(round(a_krw * (1 - base_comm)))
                 except Exception:
                     b_krw = 0
                 rec["트리플 공급가(₩)"] = b_krw
@@ -907,7 +923,12 @@ def apply_price_edits(df: pd.DataFrame) -> pd.DataFrame:
         if triple_rate > 0:
             pkg_sale_thb = pd.to_numeric(out["최소 마진 세일(฿)"], errors="coerce").fillna(0)
             a_krw = (pkg_sale_thb * triple_rate).round().astype(int)
-            b_krw = (a_krw * 0.95).round().astype(int)
+            try:
+                _comm_rates = st.session_state.get("commission_rates") or []
+                _first_comm = float(_comm_rates[0]) / 100.0 if _comm_rates else 0.05
+            except Exception:
+                _first_comm = 0.05
+            b_krw = (a_krw * (1 - _first_comm)).round().astype(int)
             if "트리플 공급가(₩)" in out.columns:
                 out["트리플 공급가(₩)"] = b_krw
         if "마진(₩)" in out.columns and "트리플 공급가(₩)" in out.columns:
@@ -1078,7 +1099,6 @@ def search_tab_ui():
         return f"{p['name_ko']}  /  {p['name_en']}  (ID: {p['product_id']})"
 
     product_map = {_label(p): p for p in products}
-    # '상품명' 입력칸(좌측 3/6) 폭과 동일하게 맞춥니다.
     col_sel, _, _ = st.columns([3, 1, 2])
     with col_sel:
         sel_label = st.selectbox("상품", options=list(product_map.keys()), key="stab_product_sel", label_visibility="collapsed")
@@ -1110,20 +1130,13 @@ def search_tab_ui():
     period_map     = {_period_label(r): r for r in hits}
 
     st.markdown("---")
-    # `main()` 상단의 플랫폼 라디오에서 선택한 값을 사용합니다.
     sel_mode = st.session_state.get("stab_mode", GOLF_MODES[0][1])
     mode_val_now, _ = _golf_mode_from_label(sel_mode)
     is_mrt_now = (mode_val_now == "mrt")
 
-    # 환율/수수료 입력칸 너비를 "기간 입력칸"과 같은 비율로 맞추되,
-    # 요청대로 `수수료`가 `환율` 바로 오른쪽에 오도록 배치합니다.
-    # - mrt: 기간1/기간2가 `st.columns([1,1,1,1])` 기준 1/4 폭이므로, 환율/수수료도 각각 1/4 폭으로 놓고 둘을 인접 배치합니다.
-    # - 그 외: 기존처럼 2분할(각 1/2 폭) 유지합니다.
     if is_mrt_now:
         col_exr, col_comm, _, _ = st.columns([1, 1, 1, 1])
     else:
-        # 비-mrt(카카오/트리플)는 기간 1개 폭과 같은 스케일로 맞추기 위해
-        # 환율/수수료를 각각 1/4 폭(합 1/2)으로 배치하고 나머지는 여백 처리합니다.
         col_exr, col_comm, _ = st.columns([1, 1, 2])
 
     with col_exr:
@@ -1134,25 +1147,17 @@ def search_tab_ui():
     triple_coef = 0.89
     triple_exr  = 0.0
     if sel_mode == "트리플 골프":
-        # 환율/수수료 입력칸과 동일한 가로 사이즈에 맞춥니다.
-        # (search_tab_ui에서 비-mrt의 환율/수수료는 st.columns([1,1,2]) 기준으로 각각 1/4 폭)
         c_coef, c_texr, _ = st.columns([1, 1, 2])
         with c_coef:
             triple_coef = st.number_input("최소 마진 계수", min_value=0.01, max_value=1.0, value=0.89, step=0.01, format="%.2f", key="stab_coef")
         with c_texr:
             triple_exr = st.number_input("트리플 환율", min_value=0.0, value=45.0, step=0.1, format="%.1f", key="stab_texr")
 
-    # ── 기간 선택 (마리트는 2개까지, 나머지는 1개)
-
     calc_clicked = False
     src_list = []
     if is_mrt_now:
         st.caption("마이리얼트립은 기간을 2개까지 선택할 수 있습니다. 2개 선택 시 구글 시트에 증감률이 추가됩니다.")
 
-        # 기간 1/기간 2/마크업 계산을 한 줄(columns)로 배치합니다.
-        # "검색" 버튼과 동일한 가로 사이즈(전체 폭의 1/6)는 `마크업 계산` 버튼에,
-        # 기간 1/기간 2 입력칸 폭은 기존 값(감소된 상태)으로 유지합니다.
-        # (기간1/기간2 = 1/4, 버튼 = 1/6, 남는 공간 = 나머지)
         p1_col, p2_col, btn_col, _ = st.columns([3, 3, 2, 4])
         with p1_col:
             sel_period1 = st.selectbox("기간 1", options=period_options, key="stab_period_sel1")
@@ -1171,7 +1176,6 @@ def search_tab_ui():
                 use_container_width=True,
             )
 
-        # 체크박스는 버튼 아래로 둬서, 요청하신 "한 줄" 배치를 방해하지 않도록 합니다.
         use_two = st.checkbox("기간 2개 비교 (증감률 계산)", value=len(period_options) > 1, key="stab_use_two")
         src_list = [period_map[sel_period1]]
         if use_two and sel_period2 != sel_period1:
@@ -1180,9 +1184,6 @@ def search_tab_ui():
             st.warning("기간 1과 기간 2가 같습니다. 다른 기간을 선택해 주세요.")
             src_list = [period_map[sel_period1]]
     else:
-        # 비-mrt는 기간 selectbox와 버튼을 한 줄로 배치합니다.
-        # 버튼 폭은 "검색" 버튼과 동일하게(전체 폭의 1/6) 유지하고,
-        # 기간 selectbox 폭만 더 줄입니다.
         p_col, btn_col, _ = st.columns([2, 1, 3])
         with p_col:
             sel_period1 = st.selectbox("기간", options=period_options, key="stab_period_sel1")
@@ -1257,7 +1258,6 @@ def search_tab_ui():
         unsafe_allow_html=True,
     )
 
-    # 수정 중인 결과 인덱스 초기화
     if "stab_editing_idx" not in st.session_state:
         st.session_state["stab_editing_idx"] = None
 
@@ -1266,7 +1266,6 @@ def search_tab_ui():
     fee_editor_height = min(600, 48 + 35 * max_fee_rows)
 
     for i, res in enumerate(results_to_show):
-        # 최신 df 반영 (수정 후 갱신된 것 사용)
         gid_i = str(src_list[i].get("id") or i)
         res   = built.get(gid_i, res)
         df    = res["df"]
@@ -1416,8 +1415,6 @@ def html_tab_ui():
 
     if selected_label == "트리플 골프":
         st.info("**최소 마진 패키지세일(฿) = 패키지넷 ÷ (계수 × (1 - 수수료율))**")
-        # html_tab_ui에서 환율/수수료는 각각 `st.columns(2)`의 1/2 폭입니다.
-        # 트리플 입력칸도 동일한 1/2 폭이 되도록 맞춥니다.
         col_coef, col_triple_rate = st.columns(2)
         with col_coef:
             st.number_input("최소 마진 수식 계수", min_value=0.01, max_value=1.0, value=0.89, step=0.01, format="%.2f", key="triple_sale_coef", help="패키지 세일가(최소 마진 수식) 계산에 사용됩니다.")
@@ -1715,9 +1712,7 @@ def main():
         """
         <style>
         div[data-testid="stTitle"] { font-size: 2em !important; }
-        /* columns 내 요소들을 버튼/입력 하단 기준으로 맞추려는 시도 */
         div[data-testid="stColumns"] { align-items: flex-end !important; }
-        /* Streamlit columns 내부 실제 래퍼에 하단 정렬 적용 */
         div.stHorizontalBlock { align-items: flex-end !important; }
         div.stButton { display: flex !important; align-items: flex-end !important; }
         div[data-testid="stRadio"] label { font-size: 2.1rem; font-weight: 600; }
@@ -1729,7 +1724,6 @@ def main():
 
     st.title("⛳ 골프 요금 마크업 계산기")
 
-    # 제목 바로 밑에 플랫폼 유형을 배치합니다.
     st.radio(
         "플랫폼 유형",
         options=[m[1] for m in GOLF_MODES],
