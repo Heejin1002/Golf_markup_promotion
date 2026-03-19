@@ -68,11 +68,21 @@ def _n8n_base_url() -> str:
 
 
 def _webhook_get(path: str, params: dict) -> dict:
-    """n8n webhook GET 호출 (query string)"""
+    """n8n webhook GET 호출 (query string) - Header Auth"""
     try:
+        # secrets에서 헤더 인증 정보 읽기
+        n8n_secrets = st.secrets.get("n8n") or {}
+        auth_header_name = n8n_secrets.get("auth_header_name") or "X-API-Key"
+        auth_header_value = n8n_secrets.get("auth_header_value") or ""
+
+        headers = {}
+        if auth_header_value:
+            headers[auth_header_name] = auth_header_value
+
         r = requests.get(
             f"{_n8n_base_url()}/webhook/{path}",
             params=params,
+            headers=headers,
             timeout=15,
         )
         r.raise_for_status()
@@ -80,7 +90,6 @@ def _webhook_get(path: str, params: dict) -> dict:
     except Exception as e:
         st.error(f"webhook 오류 ({path}): {e}")
         return {}
-
 
 # =============================================================================
 # 검색 함수 (n8n webhook 경유)
@@ -127,7 +136,7 @@ def _safe_get(obj, *keys):
 # rateJson → build_table() 용 rows 변환
 # =============================================================================
 
-def parse_rate_json(rate_json_raw) -> list[dict]:
+def parse_rate_json(rate_json_raw, currency: str = "THB") -> list[dict]:
     """
     golf_rate.rateJson (str 또는 dict) 파싱 →
     build_table()이 받는 rows 리스트 반환.
@@ -168,9 +177,11 @@ def parse_rate_json(rate_json_raw) -> list[dict]:
 
         # _safe_get 으로 중간 타입이 dict가 아닌 경우 안전하게 처리
         caddy_net = _num(_safe_get(caddy_h, "nett"))
-        caddy_thb = _num(_safe_get(caddy_h, "sale", "THB"))
+        _caddy_sale = _safe_get(caddy_h, "sale") or {}
+        caddy_thb = _num(_caddy_sale.get(currency) or _caddy_sale.get("THB") or _caddy_sale.get("USD") or 0) if isinstance(_caddy_sale, dict) else 0
         cart_net  = _num(_safe_get(cart_h,  "nett"))
-        cart_thb  = _num(_safe_get(cart_h,  "sale", "THB"))
+        _cart_sale = _safe_get(cart_h, "sale") or {}
+        cart_thb  = _num(_cart_sale.get(currency) or _cart_sale.get("THB") or _cart_sale.get("USD") or 0) if isinstance(_cart_sale, dict) else 0
 
         for time_of_day in TIME_SLOTS:
             wd_t = wd_hole.get(time_of_day)
@@ -191,8 +202,12 @@ def parse_rate_json(rate_json_raw) -> list[dict]:
                     continue
 
                 net_thb = _num(time_data.get("nett"))
-                # sale 필드가 dict가 아닐 수 있으므로 _safe_get 사용
-                sale_mk = _num(_safe_get(time_data, "sale", "monkey", "THB"))
+                # sale.monkey에서 currency에 맞는 값 읽기 (THB, USD 모두 지원)
+                sale_monkey = _safe_get(time_data, "sale", "monkey") or {}
+                if isinstance(sale_monkey, dict):
+                    sale_mk = _num(sale_monkey.get(currency) or sale_monkey.get("THB") or sale_monkey.get("USD") or 0)
+                else:
+                    sale_mk = 0
 
                 if net_thb == 0 and sale_mk == 0:
                     continue
@@ -629,9 +644,14 @@ def parse_golf_html(html: str):
 
             for week_div in ('weekday', 'weekend'):
                 net_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.nett"'
-                sale_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.sale\.monkey\.THB"'
                 net_val = _extract_val(tb, net_key)
-                sale_val = _extract_val(tb, sale_key)
+                # THB, USD 순서로 시도
+                sale_val = None
+                for curr in ("THB", "USD"):
+                    sale_key = rf'name="golf_rate\.rateJson\.{week_div}\.{re.escape(hole)}\.{re.escape(time_of_day)}\.sale\.monkey\.{curr}"'
+                    sale_val = _extract_val(tb, sale_key)
+                    if sale_val:
+                        break
 
                 if (sale_val is None or sale_val == 0) and (net_val is None or net_val == 0):
                     continue
@@ -1140,7 +1160,7 @@ def search_tab_ui():
         col_exr, col_comm, _ = st.columns([1, 1, 2])
 
     with col_exr:
-        exr_str = st.text_input("환율 (THB→KRW)", value="48.5", key="stab_exr")
+        exr_str = st.text_input("환율 (THB or USD → KRW)", value="48.5", key="stab_exr")
     with col_comm:
         comm_str = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", key="stab_comm")
 
@@ -1217,7 +1237,8 @@ def search_tab_ui():
 
         for idx_s, src in enumerate(src_list):
             gid = str(src.get("id") or "")
-            rows = parse_rate_json(src.get("rateJson"))
+            currency = src.get("currencySale") or src.get("currencyNett") or "THB"
+            rows = parse_rate_json(src.get("rateJson"), currency=currency)
             if not rows:
                 st.error(f"기간 {idx_s+1}: rateJson에서 요금 데이터를 찾을 수 없습니다.")
                 continue
@@ -1400,7 +1421,7 @@ def html_tab_ui():
 
     col1, col2 = st.columns(2)
     with col1:
-        exchange_input = st.text_input("환율 (THB → KRW)", placeholder="예: 43.5", value="48.5", key="html_exr")
+        exchange_input = st.text_input("환율 (THB or USD → KRW)", placeholder="예: 43.5", value="48.5", key="html_exr")
     with col2:
         commission_input = st.text_input("수수료 (%)", placeholder="예: 4,6.6,10", value="", key="html_comm")
 
