@@ -70,7 +70,6 @@ def _n8n_base_url() -> str:
 def _webhook_get(path: str, params: dict) -> dict:
     """n8n webhook GET 호출 (query string) - Header Auth"""
     try:
-        # secrets에서 헤더 인증 정보 읽기
         n8n_secrets = st.secrets.get("n8n") or {}
         auth_header_name = n8n_secrets.get("auth_header_name") or "X-API-Key"
         auth_header_value = n8n_secrets.get("auth_header_value") or ""
@@ -96,25 +95,14 @@ def _webhook_get(path: str, params: dict) -> dict:
 # =============================================================================
 
 def search_golf_products(keyword: str) -> list[dict]:
-    """
-    n8n webhook → ES product 인덱스 검색
-    webhook: GET /webhook/golf-product-search?keyword=...
-    반환: [{product_id, name_ko, name_en, grade, address, is_golf}]
-    """
     data = _webhook_get("golf-product-search", {"keyword": keyword})
     results = data.get("results") or []
-    # statistics_city_id → 한글 도시명 추가
     for r in results:
         r["city_ko"] = _city_name(r.get("city_id"))
     return results
 
 
 def fetch_golf_rates_by_product(product_id: int) -> list[dict]:
-    """
-    n8n webhook → ES golf_rate 인덱스 조회
-    webhook: GET /webhook/golf-rate-fetch?product_id=...
-    반환: [{id, startDate, endDate, promotionName_ko/en, promotionInfo_ko/en, rateJson}]
-    """
     data = _webhook_get("golf-rate-fetch", {"product_id": product_id})
     return data.get("rates") or []
 
@@ -124,7 +112,6 @@ def fetch_golf_rates_by_product(product_id: int) -> list[dict]:
 # =============================================================================
 
 def _safe_get(obj, *keys):
-    """중첩 dict에서 안전하게 값을 꺼냅니다. 중간에 dict가 아닌 값이 있으면 None 반환."""
     for k in keys:
         if not isinstance(obj, dict):
             return None
@@ -133,14 +120,32 @@ def _safe_get(obj, *keys):
 
 
 # =============================================================================
+# caddyStatus / cartStatus 숫자 코드 → 영문 텍스트 변환
+# =============================================================================
+
+CADDY_CART_STATUS_MAP = {
+    "1": "Compulsory",
+    "2": "Include",
+    "3": "Optional",
+    "4": "User info",
+    1: "Compulsory",
+    2: "Include",
+    3: "Optional",
+    4: "User info",
+}
+
+def _resolve_status(v):
+    """caddyStatus/cartStatus 숫자 코드를 영문 텍스트로 변환"""
+    if v is None:
+        return None
+    return CADDY_CART_STATUS_MAP.get(v, str(v))
+
+
+# =============================================================================
 # rateJson → build_table() 용 rows 변환
 # =============================================================================
 
 def parse_rate_json(rate_json_raw, currency: str = "THB") -> list[dict]:
-    """
-    golf_rate.rateJson (str 또는 dict) 파싱 →
-    build_table()이 받는 rows 리스트 반환.
-    """
     if not rate_json_raw:
         return []
     try:
@@ -175,7 +180,6 @@ def parse_rate_json(rate_json_raw, currency: str = "THB") -> list[dict]:
         caddy_h   = caddy_sec.get(hole) or {}
         cart_h    = cart_sec.get(hole)  or {}
 
-        # _safe_get 으로 중간 타입이 dict가 아닌 경우 안전하게 처리
         caddy_net = _num(_safe_get(caddy_h, "nett"))
         _caddy_sale = _safe_get(caddy_h, "sale") or {}
         caddy_thb = _num(_caddy_sale.get(currency) or _caddy_sale.get("THB") or _caddy_sale.get("USD") or 0) if isinstance(_caddy_sale, dict) else 0
@@ -194,16 +198,15 @@ def parse_rate_json(rate_json_raw, currency: str = "THB") -> list[dict]:
                 t = section_hole.get(time)
                 return t.get(key) if isinstance(t, dict) else None
 
-            caddy_status = _status(caddy_h, time_of_day, "caddyStatus")
-            cart_status  = _status(cart_h,  time_of_day, "cartStatus")
+            # ★ 수정: 숫자 코드 → 영문 텍스트 변환 적용
+            caddy_status = _resolve_status(_status(caddy_h, time_of_day, "caddyStatus"))
+            cart_status  = _resolve_status(_status(cart_h,  time_of_day, "cartStatus"))
 
             for week_div, time_data in [("weekday", wd_t), ("weekend", we_t)]:
                 if _is_empty(time_data) or not isinstance(time_data, dict):
                     continue
 
                 net_thb = _num(time_data.get("nett"))
-                # sale 필드가 dict가 아닐 수 있으므로 _safe_get 사용
-                # sale.monkey에서 currency에 맞는 값 읽기 (THB, USD 모두 지원)
                 sale_monkey = _safe_get(time_data, "sale", "monkey") or {}
                 if isinstance(sale_monkey, dict):
                     sale_mk = _num(sale_monkey.get(currency) or sale_monkey.get("THB") or sale_monkey.get("USD") or 0)
@@ -1062,7 +1065,6 @@ def style_df(df):
 # =============================================================================
 
 def search_tab_ui():
-    # session_state 초기화
     for k, v in [
         ("stab_products",  []),
         ("stab_selected",  None),
@@ -1223,8 +1225,8 @@ def search_tab_ui():
                 commission_rates = []
 
         mode_val, _ = _golf_mode_from_label(sel_mode)
-        built = {}  # 새 계산 시 기존 결과 초기화
-        st.session_state["stab_editing_idx"] = None  # 수정 모드 초기화
+        built = {}
+        st.session_state["stab_editing_idx"] = None
 
         for idx_s, src in enumerate(src_list):
             gid = str(src.get("id") or "")
@@ -1252,7 +1254,6 @@ def search_tab_ui():
 
         st.session_state["stab_built"] = built
 
-    # ── 결과 표시
     built = st.session_state.get("stab_built") or {}
     results_to_show = [built[str(s.get("id") or "")] for s in src_list if str(s.get("id") or "") in built]
 
@@ -1365,7 +1366,6 @@ def search_tab_ui():
         csv = df.to_csv(index=False, encoding="utf-8-sig")
         st.download_button("📥 CSV 다운로드", data=csv, file_name=f"golf_{selected['product_id']}_{gid_i}.csv", mime="text/csv", key=f"stab_csv_{gid_key}_{i}")
 
-    # ── 구글 시트 내보내기
     has_gcp_secret = bool(st.secrets.get("gcp_service_account"))
     sheet_url = "https://docs.google.com/spreadsheets/d/1qDp5Ty_NnQgYKfyhOnV0l5q7v8TPFtvsIi91GirO180/edit"
     if GSPREAD_AVAILABLE and has_gcp_secret:
@@ -1391,11 +1391,10 @@ def search_tab_ui():
 
 
 # =============================================================================
-# HTML 입력 탭 UI (기존 main() 로직)
+# HTML 입력 탭 UI
 # =============================================================================
 
 def html_tab_ui():
-    # session_state 초기화
     for key, default in [
         ('html_key', 0), ('result_df', None),
         ('exchange_rate', 0.0), ('commission_rates', []),
