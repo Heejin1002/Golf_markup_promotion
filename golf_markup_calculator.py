@@ -107,6 +107,68 @@ def fetch_golf_rates_by_product(product_id: int) -> list[dict]:
     return data.get("rates") or []
 
 
+def fetch_holiday_types(product_id: int, start_date: str, end_date: str) -> list[dict]:
+    """공휴일 체크 API 호출 → 날짜별 dayType 분류 반환
+    dayType: 'normal' / '공휴일(평일)' / '공휴일(주말)'
+    """
+    try:
+        # 날짜 범위 생성
+        date_list = []
+        current = datetime.date.fromisoformat(start_date)
+        end = datetime.date.fromisoformat(end_date)
+        while current <= end:
+            date_list.append(current.isoformat())
+            current += datetime.timedelta(days=1)
+
+        if not date_list:
+            return []
+
+        # multipart/form-data 전송 (curl -F 방식과 동일)
+        files = [("product_id", (None, str(product_id)))]
+        for d in date_list:
+            files.append(("holidayDateList[]", (None, d)))
+
+        r = requests.post(
+            "https://www.monkeytravel.com/api/product/productHolidayCheck.php",
+            files=files,
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data") or []
+
+        output = []
+        for item in items:
+            holiday_type = item.get("holidayType", 0)
+            if holiday_type == 2:
+                holiday_type = 0
+            target_date = item.get("targetDate", "")
+            try:
+                dow = datetime.date.fromisoformat(target_date).weekday()  # 0=월 6=일
+            except Exception:
+                continue
+            is_weekend = dow >= 5  # 토(5), 일(6)
+
+            if holiday_type == 0:
+                day_type = "normal"
+            elif holiday_type == 1 and not is_weekend:
+                day_type = "공휴일(평일)"
+            else:
+                day_type = "공휴일(주말)"
+
+            dow_kr = ["월", "화", "수", "목", "금", "토", "일"][dow]
+            output.append({
+                "targetDate": target_date,
+                "holidayType": holiday_type,
+                "dayType": day_type,
+                "dayOfWeek": dow_kr,
+            })
+        return output
+    except Exception as e:
+        st.warning(f"공휴일 조회 실패: {e}")
+        return []
+
+
 # =============================================================================
 # 안전한 중첩 dict 접근 헬퍼
 # =============================================================================
@@ -1188,6 +1250,34 @@ def search_tab_ui():
                 use_container_width=True,
             )
 
+        # ── 공휴일(평일) 드롭다운 ──────────────────────────────
+        _src1 = period_map.get(sel_period1) or {}
+        _hol_start = _src1.get("startDate") or ""
+        _hol_end   = _src1.get("endDate")   or ""
+        if _hol_start and _hol_end:
+            _hol_cache_key = f"holiday_{selected['product_id']}_{_hol_start}_{_hol_end}"
+            if _hol_cache_key not in st.session_state:
+                with st.spinner("공휴일 조회 중..."):
+                    st.session_state[_hol_cache_key] = fetch_holiday_types(
+                        selected["product_id"], _hol_start, _hol_end
+                    )
+            _hol_data = st.session_state[_hol_cache_key]
+            _hol_weekday = [
+                f"{h['targetDate']} ({h['dayOfWeek']})"
+                for h in _hol_data if h["dayType"] == "공휴일(평일)"
+            ]
+            if _hol_weekday:
+                _hol_col, _ = st.columns([2, 4])
+                with _hol_col:
+                    st.selectbox(
+                        f"🎌 [기간 1] 공휴일(평일) — {len(_hol_weekday)}일",
+                        options=_hol_weekday,
+                        key=f"stab_hol_sel_{selected['product_id']}_{_hol_start}_{_hol_end}",
+                        help="holidayType=1 이면서 월~금에 해당하는 날짜입니다.",
+                    )
+            else:
+                st.caption("🎌 해당 기간 내 공휴일(평일) 없음")
+
         use_two = st.checkbox("기간 2개 비교 (증감률 계산)", value=len(period_options) > 1, key="stab_use_two")
         src_list = [period_map[sel_period1]]
         if use_two and sel_period2 != sel_period1:
@@ -1207,6 +1297,34 @@ def search_tab_ui():
                 key="stab_calc",
                 use_container_width=True,
             )
+
+        # ── 공휴일(평일) 드롭다운 ──────────────────────────────
+        _src1 = period_map.get(sel_period1) or {}
+        _hol_start = _src1.get("startDate") or ""
+        _hol_end   = _src1.get("endDate")   or ""
+        if _hol_start and _hol_end:
+            _hol_cache_key = f"holiday_{selected['product_id']}_{_hol_start}_{_hol_end}"
+            if _hol_cache_key not in st.session_state:
+                with st.spinner("공휴일 조회 중..."):
+                    st.session_state[_hol_cache_key] = fetch_holiday_types(
+                        selected["product_id"], _hol_start, _hol_end
+                    )
+            _hol_data = st.session_state[_hol_cache_key]
+            _hol_weekday = [
+                f"{h['targetDate']} ({h['dayOfWeek']})"
+                for h in _hol_data if h["dayType"] == "공휴일(평일)"
+            ]
+            if _hol_weekday:
+                _hol_col, _ = st.columns([2, 4])
+                with _hol_col:
+                    st.selectbox(
+                        f"🎌 공휴일(평일) — {len(_hol_weekday)}일",
+                        options=_hol_weekday,
+                        key=f"stab_hol_sel_{selected['product_id']}_{_hol_start}_{_hol_end}",
+                        help="holidayType=1 이면서 월~금에 해당하는 날짜입니다.",
+                    )
+            else:
+                st.caption("🎌 해당 기간 내 공휴일(평일) 없음")
 
     gid_key = "_".join(str(s.get("id") or "") for s in src_list)
 
